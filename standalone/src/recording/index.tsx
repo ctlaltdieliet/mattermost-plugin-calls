@@ -9,14 +9,14 @@ import {logErr, logInfo} from 'plugin/log';
 import {pluginId} from 'plugin/manifest';
 import {Store} from 'plugin/types/mattermost-webapp';
 import {
-    fetchTranslationsFile,
     getPluginPath,
+    getTranslations,
     getUserIDsForSessions,
     runWithRetry,
     setCallsGlobalCSSVars,
 } from 'plugin/utils';
 import React from 'react';
-import ReactDOM from 'react-dom';
+import {createRoot, Root} from 'react-dom/client';
 import {IntlProvider} from 'react-intl';
 import {Provider} from 'react-redux';
 import {getJobID} from 'src/common';
@@ -28,6 +28,8 @@ import {
     RECEIVED_CALL_PROFILE_IMAGES,
 } from './action_types';
 import RecordingView from './components/recording_view';
+
+let recordingRoot: Root | null = null;
 
 async function fetchProfileImages(ids: string[]) {
     const profileImages: {[userID: string]: string} = {};
@@ -77,28 +79,23 @@ async function initRecording({store, theme}: InitCbProps) {
     setCallsGlobalCSSVars(theme.sidebarBg);
 
     const locale = getCurrentUserLocale(store.getState()) || 'en';
-    let messages;
-    if (locale !== 'en') {
-        try {
-            messages = await runWithRetry(() => fetchTranslationsFile(locale));
-        } catch (err) {
-            logErr('failed to fetch translations files', err);
-        }
-    }
 
-    ReactDOM.render(
-        <Provider store={store}>
-            <IntlProvider
-                locale={locale}
-                key={locale}
-                defaultLocale='en'
-                messages={messages}
-            >
-                <RecordingView/>
-            </IntlProvider>
-        </Provider>,
-        document.getElementById('root'),
-    );
+    const rootEl = document.getElementById('root');
+    if (rootEl) {
+        recordingRoot ??= createRoot(rootEl);
+        recordingRoot.render(
+            <Provider store={store}>
+                <IntlProvider
+                    locale={locale}
+                    key={locale}
+                    defaultLocale='en'
+                    messages={getTranslations(locale)}
+                >
+                    <RecordingView/>
+                </IntlProvider>
+            </Provider>,
+        );
+    }
 }
 
 function wsHandlerRecording(store: Store, ev: WebSocketMessage<WebsocketEventData>) {
@@ -160,6 +157,8 @@ function wsHandlerRecording(store: Store, ev: WebSocketMessage<WebsocketEventDat
 }
 
 function deinitRecording() {
+    recordingRoot?.unmount();
+    recordingRoot = null;
     window.callsClient?.destroy();
     delete window.callsClient;
 }

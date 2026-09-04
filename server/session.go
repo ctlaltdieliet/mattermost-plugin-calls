@@ -292,6 +292,8 @@ func (p *Plugin) removeUserSession(state *callState, userID, originalConnID, con
 		return fmt.Errorf("session not found in call state")
 	}
 
+	us := state.sessions[originalConnID]
+
 	if err := p.store.DeleteCallSession(originalConnID); err != nil {
 		return fmt.Errorf("failed to delete call session: %w", err)
 	}
@@ -307,6 +309,26 @@ func (p *Plugin) removeUserSession(state *callState, userID, originalConnID, con
 		}
 		p.LogDebug("removed session was sharing, sending screen off event", "userID", userID, "connID", connID, "originalConnID", originalConnID)
 		p.publishWebSocketEvent(wsEventUserScreenOff, map[string]interface{}{}, &WebSocketBroadcast{
+			ChannelID:           channelID,
+			ReliableClusterSend: true,
+			UserIDs:             getUserIDsFromSessions(state.sessions),
+		})
+	}
+
+	// Check if leaving session had video on.
+	if us.Video {
+		p.LogDebug("removed session had video on, sending video off event", "userID", userID, "connID", connID, "originalConnID", originalConnID)
+		// Accumulate video duration if user left with video still on
+		if state.Call.Props.VideoStartAt != nil {
+			if startTime, exists := state.Call.Props.VideoStartAt[originalConnID]; exists && startTime > 0 {
+				state.Call.Stats.VideoDuration += secondsSinceTimestamp(startTime)
+				delete(state.Call.Props.VideoStartAt, originalConnID)
+			}
+		}
+		p.publishWebSocketEvent(wsEventUserVideoOff, map[string]interface{}{
+			"userID":     userID,
+			"session_id": originalConnID,
+		}, &WebSocketBroadcast{
 			ChannelID:           channelID,
 			ReliableClusterSend: true,
 			UserIDs:             getUserIDsFromSessions(state.sessions),
@@ -440,14 +462,89 @@ func (p *Plugin) removeUserSession(state *callState, userID, originalConnID, con
 		if state.Call.Props.ScreenStartAt > 0 {
 			state.Call.Stats.ScreenDuration += secondsSinceTimestamp(state.Call.Props.ScreenStartAt)
 		}
+		// Finalize any ongoing video durations
+		if state.Call.Props.VideoStartAt != nil {
+			for sessionID, startTime := range state.Call.Props.VideoStartAt {
+				if startTime > 0 {
+					state.Call.Stats.VideoDuration += secondsSinceTimestamp(startTime)
+					p.LogDebug("finalized video duration for session at call end", "sessionID", sessionID, "startTime", startTime)
+				}
+			}
+			// Clear the map since call is ending
+			state.Call.Props.VideoStartAt = nil
+		}
+		// setCallEnded clears Props.Participants, so read it while it's still there.
+		participants := mapKeys(state.Call.Props.Participants)
+
 		setCallEnded(&state.Call)
 
+		p.cancelDMNoAnswerTimer(channelID)
+
+		// A DM call that only ever had the caller in it was never answered, so hanging up
+		// cancelled it rather than ended it.
+		reason := callEndReasonNormal
+		if len(participants) == 1 {
+			channel, appErr := p.API.GetChannel(channelID)
+			if appErr != nil {
+				p.LogError("failed to get channel for call end reason", "err", appErr.Error(), "channelID", channelID)
+			} else if channel.Type == model.ChannelTypeDirect {
+				reason = callEndReasonCanceledByCaller
+			}
+		}
+
 		defer func() {
-			_, err := p.updateCallPostEnded(state.Call.PostID, mapKeys(state.Call.Props.Participants))
+			_, err := p.updateCallPostEnded(state.Call.PostID, participants, reason)
 			if err != nil {
 				p.LogError("failed to update call post ended", "err", err.Error(), "channelID", channelID)
 			}
 		}()
+	}
+
+	remainingUsers := state.distinctNonBotUserIDs(p.getBotID())
+	_, leaverStillConnected := remainingUsers[userID]
+
+	if userID != p.getBotID() && len(remainingUsers) == 1 && !leaverStillConnected {
+		ch, appErr := p.API.GetChannel(channelID)
+		if appErr != nil {
+			p.LogError("failed to get channel for DM auto-end check", "err", appErr.Error(), "channelID", channelID)
+		} else if ch.Type == model.ChannelTypeDirect {
+			p.LogDebug("DM auto-end: participant left, ending call", "channelID", channelID, "userID", userID)
+			p.publishWebSocketEvent(wsEventCallEnd, map[string]interface{}{}, &WebSocketBroadcast{
+				ChannelID: channelID, ReliableClusterSend: true,
+			})
+
+			callID := state.Call.ID
+			nodeID := state.Call.Props.NodeID
+			gracePeriod := dmCallEndGracePeriod
+
+			go func() {
+				select {
+				case <-time.After(gracePeriod):
+				case <-p.stopCh:
+					return
+				}
+
+				call, err := p.store.GetCall(callID, db.GetCallOpts{})
+				if err != nil {
+					p.LogError("DM auto-end: failed to get call", "err", err.Error())
+				}
+
+				sessions, err := p.store.GetCallSessions(callID, db.GetCallSessionOpts{})
+				if err != nil {
+					p.LogError("DM auto-end: failed to get call sessions", "err", err.Error())
+				}
+
+				for _, s := range sessions {
+					if err := p.closeRTCSession(s.UserID, s.ID, channelID, nodeID, callID); err != nil {
+						p.LogError("DM auto-end: failed to close RTC session", "err", err.Error())
+					}
+				}
+
+				if err := p.cleanCallState(call); err != nil {
+					p.LogError("DM auto-end: failed to clean call state", "err", err.Error())
+				}
+			}()
+		}
 	}
 
 	if err := p.store.UpdateCall(&state.Call); err != nil {

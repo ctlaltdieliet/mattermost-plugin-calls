@@ -1,8 +1,10 @@
 // Copyright (c) 2020-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
+/* eslint-disable max-lines */
+
 import {makeCallsBaseAndBadgeRGB, rgbToCSS} from '@mattermost/calls-common';
-import {CallJobMetadata, CallPostProps, CallRecordingPostProps, SessionState, UserSessionState} from '@mattermost/calls-common/lib/types';
+import {CallJobMetadata, CallRecordingPostProps, SessionState, UserSessionState} from '@mattermost/calls-common/lib/types';
 import {Channel} from '@mattermost/types/channels';
 import {ClientConfig} from '@mattermost/types/config';
 import {Post} from '@mattermost/types/posts';
@@ -21,7 +23,7 @@ import {parseSemVer} from 'semver-parser';
 import CallsClient from 'src/client';
 import {STORAGE_CALLS_SHARE_AUDIO_WITH_SCREEN} from 'src/constants';
 import RestClient from 'src/rest_client';
-import {DesktopMessage} from 'src/types/types';
+import {CallPostStatus, CallsPostProps} from 'src/types/types';
 import {notificationSounds} from 'src/webapp_globals';
 
 import {logDebug, logErr, logWarn} from './log';
@@ -252,9 +254,11 @@ export function stateSortSessions(presenterID: string, considerReaction = false)
 }
 
 export async function getScreenStream(sourceID?: string, withAudio?: boolean): Promise<MediaStream | null> {
+    logDebug(`getScreenStream called with sourceID: ${sourceID}, withAudio: ${withAudio}`);
     let screenStream: MediaStream | null = null;
 
     if (window.desktop) {
+        logDebug('getScreenStream: using Electron getUserMedia');
         try {
             // electron
             const options = {
@@ -270,18 +274,20 @@ export async function getScreenStream(sourceID?: string, withAudio?: boolean): P
                 audio: withAudio ? {mandatory: options} as Record<string, unknown> : false,
             });
         } catch (err) {
-            logErr(err);
+            logErr('getScreenStream error:', err);
             return null;
         }
     } else {
         // browser
+        logDebug(`getScreenStream: using browser getDisplayMedia with audio: ${Boolean(withAudio)}`);
         try {
             screenStream = await navigator.mediaDevices.getDisplayMedia({
                 video: true,
                 audio: Boolean(withAudio),
             });
+            logDebug(`getScreenStream: received stream with ${screenStream?.getVideoTracks().length} video tracks and ${screenStream?.getAudioTracks().length} audio tracks`);
         } catch (err) {
-            logErr(err);
+            logErr('getScreenStream error:', err);
         }
     }
 
@@ -389,10 +395,6 @@ export function playSound(name: string) {
         return;
     }
 
-    if (src.indexOf('/') === 0) {
-        src = getPluginStaticPath() + src;
-    }
-
     const audio = new Audio(src);
     audio.play();
     audio.onended = () => {
@@ -461,26 +463,6 @@ export function sendDesktopError(channelID?: string, errMsg?: string) {
 
 export function capitalize(input: string) {
     return input.charAt(0).toUpperCase() + input.slice(1);
-}
-
-export async function fetchTranslationsFile(locale: string) {
-    if (locale === 'en') {
-        return {};
-    }
-    try {
-        // eslint-disable-next-line global-require
-        const filename = require(`../i18n/${locale}.json`).default;
-        if (!filename) {
-            throw new Error(`translations file not found for locale '${locale}'`);
-        }
-        const res = await fetch(filename.indexOf('/') === 0 ? getPluginStaticPath() + filename : filename);
-        const translations = await res.json();
-        logDebug(`loaded i18n file for locale '${locale}'`);
-        return translations;
-    } catch (err) {
-        logWarn(`failed to load i18n file for locale '${locale}':`, err);
-        return {};
-    }
 }
 
 export function untranslatable(msg: string) {
@@ -618,7 +600,22 @@ function getJobMetadataMap(obj: {[key: string]: CallJobMetadata}) {
     return out;
 }
 
-export function getCallPropsFromPost(post: Post): CallPostProps {
+function getCallStatusFromPostProps(props: Post['props']) {
+    if (!props || !('call_status' in props)) {
+        return '';
+    }
+
+    if (typeof props.call_status !== 'string') {
+        return '';
+    }
+
+    if (Object.values<unknown>(CallPostStatus).includes(props.call_status)) {
+        return props.call_status as CallPostStatus;
+    }
+    return '';
+}
+
+export function getCallPropsFromPost(post: Post): CallsPostProps {
     return {
         title: typeof post.props?.title === 'string' ? post.props.title : '',
         start_at: typeof post.props?.start_at === 'number' ? post.props.start_at : 0,
@@ -626,6 +623,7 @@ export function getCallPropsFromPost(post: Post): CallPostProps {
         recordings: isValidObject(post.props?.recordings) ? getJobMetadataMap(post.props.recordings) : {},
         transcriptions: isValidObject(post.props?.transcriptions) ? getJobMetadataMap(post.props.transcriptions) : {},
         participants: Array.isArray(post.props?.participants) ? post.props.participants : [],
+        call_status: getCallStatusFromPostProps(post.props),
     };
 }
 
@@ -651,15 +649,9 @@ export function getPersistentStorage() {
     return window.desktop ? localStorage : sessionStorage;
 }
 
-export function sendDesktopMessage(msg: DesktopMessage) {
-    // simple, fire and forget for now.
-    const ch = new BroadcastChannel('calls_widget');
-    ch.postMessage(msg);
-    ch.close();
-}
-
 export function shareAudioWithScreen() {
-    return window.localStorage.getItem(STORAGE_CALLS_SHARE_AUDIO_WITH_SCREEN) === 'on';
+    // Defaults to on when unset, so the browser surfaces its share-audio option.
+    return window.localStorage.getItem(STORAGE_CALLS_SHARE_AUDIO_WITH_SCREEN) !== 'off';
 }
 
 // Ported from mattermost-redux/src/utils/browser_info.ts

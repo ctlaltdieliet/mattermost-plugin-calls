@@ -4,7 +4,7 @@
 import {GlobalState} from '@mattermost/types/store';
 import {getChannel} from 'mattermost-redux/selectors/entities/channels';
 import {getCurrentTeamId, getMyTeams, getTeam} from 'mattermost-redux/selectors/entities/teams';
-import {getCurrentUserId} from 'mattermost-redux/selectors/entities/users';
+import {getCurrentUser, getCurrentUserId, getUser, isCurrentUserSystemAdmin} from 'mattermost-redux/selectors/entities/users';
 import {injectIntl} from 'react-intl';
 import {connect} from 'react-redux';
 import {bindActionCreators, Dispatch} from 'redux';
@@ -19,13 +19,14 @@ import {
 } from 'src/actions';
 import {
     allowScreenSharing,
-    callStartAtForCurrentCall,
+    callsConfig,
     clientConnecting,
     expandedView,
     getChannelUrlAndDisplayName,
     hostChangeAtForCurrentCall,
     hostControlNoticesForCurrentCall,
     hostIDForCurrentCall,
+    isCurrentDMCallInCallingState,
     isRecordingInCurrentCall,
     profilesInCurrentCallMap,
     recentlyJoinedUsersInCurrentCall,
@@ -33,13 +34,14 @@ import {
     recordingsEnabled,
     screenSharingSessionForCurrentCall,
     sessionForCurrentCall,
+    sessionsForOtherUsersInCall,
     sessionsInCurrentCall,
     sessionsInCurrentCallMap,
     sortedIncomingCalls,
     threadIDForCallInChannel,
     transcriptionsEnabled,
 } from 'src/selectors';
-import {alphaSortSessions, stateSortSessions} from 'src/utils';
+import {alphaSortSessions, getUserIdFromDM, isDMChannel, stateSortSessions} from 'src/utils';
 import {modals} from 'src/webapp_globals';
 
 import CallWidget from './component';
@@ -63,8 +65,15 @@ const mapStateToProps = (state: GlobalState) => {
 
     const callThreadID = threadIDForCallInChannel(state, channel?.id || '');
 
+    let connectedDMUser;
+    if (channel && isDMChannel(channel)) {
+        const otherID = getUserIdFromDM(channel.name, currentUserID);
+        connectedDMUser = getUser(state, otherID);
+    }
+
     return {
         currentUserID,
+        currentUserProfile: getCurrentUser(state),
         channel,
         team: getTeam(state, channel?.team_id || getCurrentTeamId(state)),
         channelURL,
@@ -73,7 +82,6 @@ const mapStateToProps = (state: GlobalState) => {
         sessionsMap: sessionsInCurrentCallMap(state),
         currentSession: sessionForCurrentCall(state),
         profiles,
-        callStartAt: callStartAtForCurrentCall(state),
         callHostID: hostIDForCurrentCall(state),
         callHostChangeAt: hostChangeAtForCurrentCall(state),
         callRecording: recordingForCurrentCall(state),
@@ -89,6 +97,11 @@ const mapStateToProps = (state: GlobalState) => {
         clientConnecting: clientConnecting(state),
         callThreadID,
         recordingsEnabled: recordingsEnabled(state),
+        enableVideo: callsConfig(state).EnableVideo && isDMChannel(channel),
+        connectedDMUser,
+        otherSessions: sessionsForOtherUsersInCall(state),
+        isAdmin: isCurrentUserSystemAdmin(state),
+        isDMCalling: isCurrentDMCallInCallingState(state),
     };
 };
 

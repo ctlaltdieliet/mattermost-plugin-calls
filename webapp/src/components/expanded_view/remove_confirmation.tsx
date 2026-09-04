@@ -18,12 +18,11 @@ type Props = {
 export const RemoveConfirmation = ({profile, onConfirm, onCancel}: Props) => {
     const {formatMessage} = useIntl();
 
-    // @ts-ignore
     const body = formatMessage({
         defaultMessage: 'Are you sure you want to remove <b>{userName}</b> from the call?',
     }, {
         userName: getUserDisplayName(profile),
-        b: (text: string) => <b>{text}</b>,
+        b: (text: React.ReactNode) => <b>{text}</b>,
     });
 
     return (

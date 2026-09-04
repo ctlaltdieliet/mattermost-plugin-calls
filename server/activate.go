@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"time"
 
 	"github.com/mattermost/mattermost-plugin-calls/server/cluster"
 	"github.com/mattermost/mattermost-plugin-calls/server/enterprise"
@@ -19,6 +20,9 @@ import (
 	"github.com/mattermost/mattermost/server/public/model"
 	"github.com/mattermost/mattermost/server/public/shared/i18n"
 )
+
+// jobSessionTTL matches the transcriber's own MaxDurationSec ceiling (2 × maxRecDurationMinutes).
+const jobSessionTTL = time.Duration(maxRecDurationMinutes) * time.Minute * 2
 
 func (p *Plugin) createBotSession() (*model.Session, error) {
 	m, err := cluster.NewMutex(p.API, p.metrics, "ensure_bot", cluster.MutexConfig{})
@@ -50,6 +54,17 @@ func (p *Plugin) createBotSession() (*model.Session, error) {
 		return nil, appErr
 	}
 
+	return session, nil
+}
+
+func (p *Plugin) createJobSession() (*model.Session, error) {
+	session, appErr := p.API.CreateSession(&model.Session{
+		UserId:    p.botSession.UserId,
+		ExpiresAt: time.Now().Add(jobSessionTTL).UnixMilli(),
+	})
+	if appErr != nil {
+		return nil, appErr
+	}
 	return session, nil
 }
 
@@ -166,6 +181,9 @@ func (p *Plugin) OnActivate() (retErr error) {
 		if err := p.cleanUpState(); err != nil {
 			p.LogError("failed to cleanup state", "err", err.Error())
 		}
+
+		go p.runRTCDSessionReconciler()
+		p.LogDebug("started RTCD session reconciler")
 	} else {
 		rtcServerConfig := rtc.ServerConfig{
 			ICEAddressUDP:   rtc.ICEAddress(cfg.UDPServerAddress),
@@ -215,6 +233,13 @@ func (p *Plugin) OnActivate() (retErr error) {
 	// Cluster events need to be handled regardless of whether the embedded RTC service or RTCD are in use.
 	go p.clusterEventsHandler()
 
+	// Start historical metrics update job (runs every hour)
+	if p.metrics != nil {
+		p.metricsUpdateTicker = time.NewTicker(1 * time.Hour)
+		go p.runMetricsUpdateJob()
+		p.LogDebug("started historical metrics update job")
+	}
+
 	p.LogDebug("activated", "ClusterID", status.ClusterId)
 
 	return nil
@@ -223,6 +248,18 @@ func (p *Plugin) OnActivate() (retErr error) {
 func (p *Plugin) OnDeactivate() error {
 	p.LogDebug("deactivate")
 	close(p.stopCh)
+
+	// Stop historical metrics update ticker
+	if p.metricsUpdateTicker != nil {
+		p.metricsUpdateTicker.Stop()
+		p.LogDebug("stopped historical metrics update job")
+	}
+
+	p.dmNoAnswerTimersMut.Lock()
+	for _, t := range p.dmNoAnswerTimers {
+		t.Stop()
+	}
+	p.dmNoAnswerTimersMut.Unlock()
 
 	if err := p.store.Close(); err != nil {
 		p.LogError(err.Error())

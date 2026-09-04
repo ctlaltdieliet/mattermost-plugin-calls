@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net"
 	"net/http"
 	"os"
@@ -137,6 +138,8 @@ type ClientConfig struct {
 	GroupCallsAllowed bool
 	// When set to true it enables experimental support for using the data channel for signaling.
 	EnableDCSignaling *bool
+	// When set to true it enables video calls in direct message channels.
+	EnableVideo *bool
 }
 
 const (
@@ -262,6 +265,9 @@ func (c *configuration) SetDefaults() {
 	}
 	if c.EnableDCSignaling == nil {
 		c.EnableDCSignaling = model.NewPointer(false)
+	}
+	if c.EnableVideo == nil {
+		c.EnableVideo = model.NewPointer(false)
 	}
 }
 
@@ -455,6 +461,10 @@ func (c *configuration) Clone() *configuration {
 		cfg.EnableDCSignaling = model.NewPointer(*c.EnableDCSignaling)
 	}
 
+	if c.EnableVideo != nil {
+		cfg.EnableVideo = model.NewPointer(*c.EnableVideo)
+	}
+
 	return &cfg
 }
 
@@ -525,6 +535,7 @@ func (p *Plugin) getClientConfig(c *configuration) ClientConfig {
 		EnableAV1:            c.EnableAV1,
 		GroupCallsAllowed:    p.licenseChecker.GroupCallsAllowed(),
 		EnableDCSignaling:    c.EnableDCSignaling,
+		EnableVideo:          c.EnableVideo,
 	}
 }
 
@@ -634,7 +645,19 @@ func (p *Plugin) ConfigurationWillBeSaved(newCfg *model.Config) (*model.Config, 
 	appErr := model.NewAppError("saveConfig", "app.save_config.error", nil, "", http.StatusBadRequest)
 	appErr.SkipTranslation = true
 
-	js, err := json.Marshal(configData)
+	// Fields marked "secret": true in plugin.json are sanitized to model.FakeSetting by
+	// Mattermost before being passed to this hook. Work on a copy with those fields removed
+	// so they are skipped during unmarshal and validation without mutating newCfg (which
+	// the server will save). The fields were already valid when originally saved.
+	configDataForValidation := make(map[string]any, len(configData))
+	maps.Copy(configDataForValidation, configData)
+	for k, v := range configDataForValidation {
+		if v == model.FakeSetting {
+			delete(configDataForValidation, k)
+		}
+	}
+
+	js, err := json.Marshal(configDataForValidation)
 	if err != nil {
 		err = fmt.Errorf("failed to marshal config data: %w", err)
 		p.LogError(err.Error())
@@ -690,6 +713,16 @@ func (p *Plugin) setOverrides(cfg *configuration) {
 			*cfg.MaxCallParticipants = cloudStarterMaxParticipantsDefault
 		} else {
 			*cfg.MaxCallParticipants = cloudPaidMaxParticipantsDefault
+		}
+	}
+
+	// v1.8.0 (MM-62732) MM_CALLS_RTCD_URL is DEPRECATED in favor of MM_CALLS_RTCD_SERVICE_URL.
+	// If the canonical env var didn't win, check the deprecated one and surface it so /env reflects reality.
+	if _, alreadySet := p.configEnvOverrides["RTCDServiceURL"]; !alreadySet {
+		if url := os.Getenv("MM_CALLS_RTCD_URL"); url != "" {
+			p.LogWarn("MM_CALLS_RTCD_URL is deprecated and will be removed in a future release, please use MM_CALLS_RTCD_SERVICE_URL instead")
+			cfg.RTCDServiceURL = url
+			p.configEnvOverrides["RTCDServiceURL"] = url
 		}
 	}
 

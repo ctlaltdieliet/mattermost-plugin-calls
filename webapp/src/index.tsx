@@ -5,17 +5,19 @@
 import {CallChannelState} from '@mattermost/calls-common/lib/types';
 import {hasDCSignalingLockSupport} from '@mattermost/calls-common/lib/utils';
 import WebSocketClient from '@mattermost/client/websocket';
-import type {DesktopAPI} from '@mattermost/desktop-api';
+import {type DesktopAPI} from '@mattermost/desktop-api';
 import {PluginAnalyticsRow} from '@mattermost/types/admin';
+import {getChannel as getChannelAction} from 'mattermost-redux/actions/channels';
 import {Client4} from 'mattermost-redux/client';
-import {getChannel, getCurrentChannelId} from 'mattermost-redux/selectors/entities/channels';
+import {getChannel, getCurrentChannel, getCurrentChannelId} from 'mattermost-redux/selectors/entities/channels';
 import {getConfig, getServerVersion} from 'mattermost-redux/selectors/entities/general';
 import {getCurrentUserLocale} from 'mattermost-redux/selectors/entities/i18n';
-import {getCurrentTeamId} from 'mattermost-redux/selectors/entities/teams';
+import {getTheme} from 'mattermost-redux/selectors/entities/preferences';
+import {getCurrentTeam, getCurrentTeamId} from 'mattermost-redux/selectors/entities/teams';
 import {getCurrentUserId, isCurrentUserSystemAdmin} from 'mattermost-redux/selectors/entities/users';
 import {ActionFuncAsync} from 'mattermost-redux/types/actions';
 import React, {useEffect} from 'react';
-import ReactDOM from 'react-dom';
+import {createRoot, Root} from 'react-dom/client';
 import {FormattedMessage, injectIntl, IntlProvider} from 'react-intl';
 import {Provider} from 'react-redux';
 import {AnyAction} from 'redux';
@@ -44,6 +46,7 @@ import EnableDCSignaling from 'src/components/admin_console_settings/enable_dc_s
 import EnableIPv6 from 'src/components/admin_console_settings/enable_ipv6';
 import EnableRinging from 'src/components/admin_console_settings/enable_ringing';
 import EnableSimulcast from 'src/components/admin_console_settings/enable_simulcast';
+import EnableVideo from 'src/components/admin_console_settings/enable_video';
 import ICEHostOverride from 'src/components/admin_console_settings/ice_host_override';
 import ICEHostPortOverride from 'src/components/admin_console_settings/ice_host_port_override';
 import ICEServersConfigs from 'src/components/admin_console_settings/ice_servers_configs';
@@ -81,10 +84,6 @@ import TURNCredentialsExpirationMinutes from 'src/components/admin_console_setti
 import TURNStaticAuthSecret from 'src/components/admin_console_settings/turn_static_auth_secret';
 import UDPServerAddress from 'src/components/admin_console_settings/udp_server_address';
 import UDPServerPort from 'src/components/admin_console_settings/udp_server_port';
-import {
-    EndCallConfirmation,
-    IDEndCallConfirmation,
-} from 'src/components/call_widget/end_call_confirmation';
 import {PostTypeCloudTrialRequest} from 'src/components/custom_post_types/post_type_cloud_trial_request';
 import {PostTypeRecording} from 'src/components/custom_post_types/post_type_recording';
 import {
@@ -92,14 +91,17 @@ import {
     StopRecordingConfirmation,
 } from 'src/components/expanded_view/stop_recording_confirmation';
 import {IncomingCallContainer} from 'src/components/incoming_calls/call_container';
+import JoinCallWatcher from 'src/components/join_call_watcher';
 import RecordingsFilePreview from 'src/components/recordings_file_preview';
+import {makeSameChannelLinkClickHandler} from 'src/components/same_channel_link_click_handler';
 import AudioDevicesSettingsSection from 'src/components/user_settings/audio_devices_settings_section';
 import ScreenSharingSettingsSection from 'src/components/user_settings/screen_sharing_settings_section';
-import {CALL_RECORDING_POST_TYPE, CALL_START_POST_TYPE, CALL_TRANSCRIPTION_POST_TYPE, DisabledCallsErr} from 'src/constants';
+import VideoDevicesSettingsSection from 'src/components/user_settings/video_devices_settings_section';
+import {CALL_EVENT_POST_TYPE, CALL_RECORDING_POST_TYPE, CALL_TRANSCRIPTION_POST_TYPE, DisabledCallsErr} from 'src/constants';
 import {desktopNotificationHandler} from 'src/desktop_notifications';
 import RestClient from 'src/rest_client';
 import slashCommandsHandler from 'src/slash_commands';
-import {CallActions, CurrentCallData, CurrentCallDataDefault, DesktopMessageType} from 'src/types/types';
+import {CallActions, CurrentCallData, CurrentCallDataDefault} from 'src/types/types';
 import {modals} from 'src/webapp_globals';
 
 import {
@@ -111,6 +113,8 @@ import {
     USER_MUTED,
     USER_RAISE_HAND,
     USER_UNMUTED,
+    USER_VIDEO_OFF,
+    USER_VIDEO_ON,
     USERS_STATES,
 } from './action_types';
 import CallsClient from './client';
@@ -120,7 +124,7 @@ import ChannelHeaderButton from './components/channel_header_button';
 import ChannelHeaderDropdownButton from './components/channel_header_dropdown_button';
 import ChannelHeaderMenuButton from './components/channel_header_menu_button';
 import ChannelLinkLabel from './components/channel_link_label';
-import PostType from './components/custom_post_types/post_type';
+import {PostTypeEvent} from './components/custom_post_types/post_type_event';
 import {PostTypeTranscription} from './components/custom_post_types/post_type_transcription';
 import ExpandedView from './components/expanded_view';
 import CompassIcon from './components/icons/compassIcon';
@@ -129,7 +133,7 @@ import SwitchCallModal from './components/switch_call_modal';
 import {
     handleDesktopJoinedCall,
 } from './desktop';
-import {logDebug, logErr, logWarn} from './log';
+import {flushLogsToAccumulated, logDebug, logErr, logInfo} from './log';
 import {pluginId} from './manifest';
 import reducer from './reducers';
 import {
@@ -140,6 +144,7 @@ import {
     callsVersionInfo,
     channelHasCall,
     channelIDForCurrentCall,
+    clientConnecting,
     defaultEnabled,
     hasPermissionsToEnableCalls,
     iceServers,
@@ -147,6 +152,7 @@ import {
     isLimitRestricted,
     needsTURNCredentials,
     ringingEnabled,
+    sessionsInCurrentCall,
 } from './selectors';
 import {JOIN_CALL, keyToAction} from './shortcuts';
 import {convertStatsToPanels} from './stats';
@@ -161,8 +167,10 @@ import {
     getUserIDsForSessions,
     getWSConnectionURL,
     isCallsPopOut,
+    isDMChannel,
     playSound,
     sendDesktopEvent,
+    setCallsGlobalCSSVars,
     shouldRenderDesktopWidget,
 } from './utils';
 import {
@@ -187,6 +195,8 @@ import {
     handleUserScreenOn,
     handleUserUnmuted,
     handleUserUnraisedHand,
+    handleUserVideoOff,
+    handleUserVideoOn,
     handleUserVoiceOff,
     handleUserVoiceOn,
 } from './websocket_handlers';
@@ -311,6 +321,14 @@ export default class Plugin {
         registry.registerWebSocketEventHandler(`custom_${pluginId}_host_removed`, (ev) => {
             handleHostRemoved(store, ev);
         });
+
+        registry.registerWebSocketEventHandler(`custom_${pluginId}_user_video_on`, (ev) => {
+            handleUserVideoOn(store, ev);
+        });
+
+        registry.registerWebSocketEventHandler(`custom_${pluginId}_user_video_off`, (ev) => {
+            handleUserVideoOff(store, ev);
+        });
     }
 
     private initialize(registry: PluginRegistry, store: Store) {
@@ -323,6 +341,9 @@ export default class Plugin {
             Client4.setUrl(window.basename);
         }
 
+        const theme = getTheme(store.getState());
+        setCallsGlobalCSSVars(theme.sidebarBg);
+
         // Register root DOM element for Calls. This is where the widget will render.
         if (!document.getElementById('calls')) {
             const callsRoot = document.createElement('div');
@@ -333,38 +354,11 @@ export default class Plugin {
             document.getElementById('calls')?.remove();
         });
 
-        if (window.desktop) {
-            const widgetCh = new BroadcastChannel('calls_widget');
-            this.unsubscribers.push(() => {
-                widgetCh.close();
-            });
-
-            widgetCh.onmessage = (ev) => {
-                switch (ev.data?.type) {
-                case DesktopMessageType.ShowEndCallModal: {
-                    const channelID = channelIDForCurrentCall(store.getState());
-                    if (channelID) {
-                        store.dispatch(modals.openModal({
-                            modalId: IDEndCallConfirmation,
-                            dialogType: EndCallConfirmation,
-                            dialogProps: {
-                                channelID,
-                            },
-                        }));
-                    }
-                    break;
-                }
-                default:
-                    logWarn('invalid message on widget channel', ev.data);
-                }
-            };
-        }
-
         registry.registerReducer(reducer);
         const sidebarChannelLinkLabelComponentID = registry.registerSidebarChannelLinkLabelComponent(ChannelLinkLabel);
         this.unsubscribers.push(() => registry.unregisterComponent(sidebarChannelLinkLabelComponentID));
         registry.registerChannelToastComponent(injectIntl(ChannelCallToast));
-        registry.registerPostTypeComponent(CALL_START_POST_TYPE, PostType);
+        registry.registerPostTypeComponent(CALL_EVENT_POST_TYPE, PostTypeEvent);
         registry.registerPostTypeComponent(CALL_RECORDING_POST_TYPE, PostTypeRecording);
         registry.registerPostTypeComponent(CALL_TRANSCRIPTION_POST_TYPE, PostTypeTranscription);
         registry.registerPostTypeComponent('custom_cloud_trial_req', PostTypeCloudTrialRequest);
@@ -406,7 +400,23 @@ export default class Plugin {
         });
 
         const connectToCall = async (channelId: string, teamId?: string, title?: string, rootId?: string) => {
-            if (!channelIDForCurrentCall(store.getState())) {
+            if (clientConnecting(store.getState())) {
+                return;
+            }
+
+            // Prefer the live window.callsClient over Redux state: the client
+            // is the concrete "I am literally in a call right now" signal,
+            // while Redux can be transiently stale during reload reconnect.
+            // Falling back to Redux covers the case where the client hasn't
+            // attached yet on initial load.
+            const effectiveCurrentChannel = window.callsClient?.channelID ?? channelIDForCurrentCall(store.getState());
+
+            if (!effectiveCurrentChannel) {
+                // Not in any call - join the new one.
+                // Set connecting state synchronously before the first await in
+                // connectCall so the re-entrancy guard above is effective even
+                // on rapid subsequent clicks.
+                store.dispatch(setClientConnecting(true));
                 connectCall(channelId, title, rootId);
 
                 // following the thread only on join. On call start
@@ -414,9 +424,12 @@ export default class Plugin {
                 if (channelHasCall(store.getState(), channelId)) {
                     followThread(store, channelId, teamId);
                 }
-            } else if (channelIDForCurrentCall(store.getState()) !== channelId) {
+            } else if (effectiveCurrentChannel !== channelId) {
+                // In a different call - show switch modal
                 store.dispatch(showSwitchCallModal(channelId));
             }
+
+            // If already in this call, do nothing
         };
 
         const joinCall = async (channelId: string, teamId?: string, title?: string, rootId?: string) => {
@@ -510,6 +523,7 @@ export default class Plugin {
         registry.registerAdminConsoleCustomSetting('EnableAV1', EnableAV1);
         registry.registerAdminConsoleCustomSetting('EnableRinging', EnableRinging);
         registry.registerAdminConsoleCustomSetting('EnableDCSignaling', EnableDCSignaling);
+        registry.registerAdminConsoleCustomSetting('EnableVideo', EnableVideo);
 
         // RTCD Service
         if (registry.registerAdminConsoleCustomSection) {
@@ -638,11 +652,23 @@ export default class Plugin {
         }
 
         const connectCall = async (channelID: string, title?: string, rootId?: string) => {
+            const channel = getChannel(store.getState(), channelID);
+
+            // Flush any pending logs from previous call
+            flushLogsToAccumulated();
+
+            // Log separator for new call
+            const isStarting = !channelHasCall(store.getState(), channelID);
+            logInfo(`=== ${isStarting ? 'starting' : 'joining'} call at ${new Date().toISOString()}`);
+
+            // Flush separator immediately (ensures desktop clients capture it)
+            flushLogsToAccumulated();
+
             // Desktop handler
             const payload = {
                 callID: channelID,
                 title: title || '',
-                channelURL: getChannelURL(store.getState(), getChannel(store.getState(), channelID), getCurrentTeamId(store.getState())),
+                channelURL: getChannelURL(store.getState(), channel, getCurrentTeamId(store.getState())),
                 rootID: rootId || '',
                 startingCall: !channelHasCall(store.getState(), channelID),
             };
@@ -685,28 +711,33 @@ export default class Plugin {
                     enableAV1: callsConfig(state).EnableAV1,
                     dcSignaling: callsConfig(state).EnableDCSignaling,
                     dcLocking: hasDCSignalingLockSupport(callsVersionInfo(state)),
+                    enableVideo: callsConfig(state).EnableVideo && isDMChannel(channel),
                 });
-                window.currentCallData = CurrentCallDataDefault;
+                window.currentCallData = {...CurrentCallDataDefault};
 
                 const locale = getCurrentUserLocale(state) || 'en';
 
-                ReactDOM.render(
-                    <Provider store={store}>
-                        <IntlProvider
-                            locale={locale}
-                            key={locale}
-                            defaultLocale='en'
-                            messages={getTranslations(locale)}
-                        >
-                            <CallWidget/>
-                        </IntlProvider>
-                    </Provider>,
-                    document.getElementById('calls'),
-                );
+                let callWidgetRoot: Root | null = null;
+                const callsRootEl = document.getElementById('calls');
+                if (callsRootEl) {
+                    callWidgetRoot = createRoot(callsRootEl);
+                    callWidgetRoot.render(
+                        <Provider store={store}>
+                            <IntlProvider
+                                locale={locale}
+                                key={locale}
+                                defaultLocale='en'
+                                messages={getTranslations(locale)}
+                            >
+                                <CallWidget/>
+                            </IntlProvider>
+                        </Provider>,
+                    );
+                }
                 const unmountCallWidget = () => {
-                    const callsRoot = document.getElementById('calls');
-                    if (callsRoot) {
-                        ReactDOM.unmountComponentAtNode(callsRoot);
+                    if (callWidgetRoot) {
+                        callWidgetRoot.unmount();
+                        callWidgetRoot = null;
                     }
                 };
 
@@ -778,6 +809,28 @@ export default class Plugin {
                 window.callsClient.on('lower_hand', () => {
                     store.dispatch({
                         type: USER_LOWER_HAND,
+                        data: {
+                            channelID: window.callsClient?.channelID,
+                            userID: getCurrentUserId(store.getState()),
+                            session_id: window.callsClient?.getSessionID(),
+                        },
+                    });
+                });
+
+                window.callsClient.on('video_on', () => {
+                    store.dispatch({
+                        type: USER_VIDEO_ON,
+                        data: {
+                            channelID: window.callsClient?.channelID,
+                            userID: getCurrentUserId(store.getState()),
+                            session_id: window.callsClient?.getSessionID(),
+                        },
+                    });
+                });
+
+                window.callsClient.on('video_off', () => {
+                    store.dispatch({
+                        type: USER_VIDEO_OFF,
                         data: {
                             channelID: window.callsClient?.channelID,
                             userID: getCurrentUserId(store.getState()),
@@ -971,14 +1024,42 @@ export default class Plugin {
 
             await Promise.all(requests);
 
+            const sections = [
+                {
+                    title: 'Audio devices settings',
+                    component: AudioDevicesSettingsSection,
+                },
+                {
+                    title: 'Screen sharing settings',
+                    component: ScreenSharingSettingsSection,
+                },
+            ];
+
+            if (callsConfig(store.getState()).EnableVideo) {
+                sections.push({
+                    title: 'Video devices settings',
+                    component: VideoDevicesSettingsSection,
+                });
+            }
+            registry.registerUserSettings({
+                id: pluginId,
+                uiName: 'Calls',
+                icon: 'icon-phone-in-talk',
+                sections,
+            });
+
+            const currentCallChannelID = channelIDForCurrentCall(store.getState());
+
             // We don't care about fetching other calls states in pop out.
             // Current call state will be requested over websocket
             // from the ExpandedView component itself.
             if (isCallsPopOut()) {
+                await Promise.all([
+                    store.dispatch(loadProfilesByIdsIfMissing(getUserIDsForSessions(sessionsInCurrentCall(store.getState())))),
+                    store.dispatch(getChannelAction(currentCallChannelID)),
+                ]);
                 return;
             }
-
-            const currentCallChannelID = channelIDForCurrentCall(store.getState());
 
             // We pass currentCallChannelID so that we
             // can skip loading its state as a result of the HTTP calls in
@@ -1013,6 +1094,16 @@ export default class Plugin {
             });
         });
 
+        // Watch the URL for ?join_call=true and trigger a join when it appears.
+        // Handles cross-channel link clicks and pasted URLs. Same-channel
+        // clicks are handled by the click handler below since the URL never
+        // changes in that case. Routes through joinCall (not connectToCall)
+        // so URL-driven joins go through the same enabled/disabled, limit,
+        // and test-mode gating as the regular UI buttons.
+        registry.registerRootComponent(() => (
+            <JoinCallWatcher onJoinCall={joinCall}/>
+        ));
+
         // A dummy React component so we can access webapp's
         // WebSocket client through the provided hook. Just lovely.
         registry.registerGlobalComponent(() => {
@@ -1024,7 +1115,7 @@ export default class Plugin {
                 // eslint-disable-next-line max-nested-callbacks
                 this.registerReconnectHandler(registry, store, () => {
                     logDebug('websocket reconnect handler');
-                    if (!getCallsClient()) {
+                    if (!getCallsClient() && !channelIDForCurrentCall(store.getState())) {
                         logDebug('resetting state');
                         store.dispatch({
                             type: UNINIT,
@@ -1039,23 +1130,32 @@ export default class Plugin {
         this.registerWebSocketEvents(registry, store);
 
         let currChannelId = getCurrentChannelId(store.getState());
-        let joinCallParam = new URLSearchParams(window.location.search).get('join_call');
+
+        // Same-channel join_call links: when the link target is the channel
+        // we're already viewing, the webapp short-circuits navigation entirely
+        // and the URL never updates — so JoinCallWatcher can't see it. Catch
+        // those clicks here. Cross-channel clicks fall through to React Router
+        // and are handled by JoinCallWatcher after navigation.
+        const handleSameChannelLinkClick = makeSameChannelLinkClickHandler(
+            () => getCurrentTeam(store.getState())?.name,
+            () => getCurrentChannelId(store.getState()),
+            () => getCurrentChannel(store.getState())?.name,
+            joinCall,
+        );
+        document.addEventListener('click', handleSameChannelLinkClick, true);
+        this.unsubscribers.push(() => document.removeEventListener('click', handleSameChannelLinkClick, true));
+
         this.unsubscribers.push(store.subscribe(() => {
             const currentChannelId = getCurrentChannelId(store.getState());
+
+            // We only want to register the header menu component on first load
+            // and not on every channel switch.
             if (currChannelId !== currentChannelId) {
                 const firstLoad = !currChannelId;
                 currChannelId = currentChannelId;
-
-                // We only want to register the header menu component on first load and not
-                // on every channel switch.
                 if (firstLoad) {
                     registerHeaderMenuComponentIfNeeded(currentChannelId);
                 }
-
-                if (currChannelId && Boolean(joinCallParam) && !channelIDForCurrentCall(store.getState())) {
-                    connectCall(currChannelId);
-                }
-                joinCallParam = '';
             }
         }));
 

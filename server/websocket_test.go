@@ -9,11 +9,13 @@ import (
 	"os"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/mattermost/mattermost-plugin-calls/server/batching"
 	"github.com/mattermost/mattermost-plugin-calls/server/cluster"
+	"github.com/mattermost/mattermost-plugin-calls/server/db"
 	"github.com/mattermost/mattermost-plugin-calls/server/enterprise"
 	"github.com/mattermost/mattermost-plugin-calls/server/public"
 
@@ -24,6 +26,7 @@ import (
 	"github.com/mattermost/mattermost/server/public/model"
 	"github.com/mattermost/mattermost/server/public/plugin"
 
+	rtcd "github.com/mattermost/rtcd/service"
 	"github.com/mattermost/rtcd/service/rtc"
 
 	"github.com/stretchr/testify/mock"
@@ -264,7 +267,7 @@ func TestWSReader(t *testing.T) {
 				p.wsReader(us, "", "handlerID")
 			}()
 
-			time.Sleep(time.Second)
+			time.Sleep(1500 * time.Millisecond)
 			close(us.wsCloseCh)
 
 			wg.Wait()
@@ -286,7 +289,7 @@ func TestWSReader(t *testing.T) {
 				p.wsReader(us, "authSessionID", "handlerID")
 			}()
 
-			time.Sleep(time.Second)
+			time.Sleep(1500 * time.Millisecond)
 			close(us.wsCloseCh)
 
 			wg.Wait()
@@ -307,7 +310,7 @@ func TestWSReader(t *testing.T) {
 				p.wsReader(us, "authSessionID", "handlerID")
 			}()
 
-			time.Sleep(time.Second)
+			time.Sleep(1500 * time.Millisecond)
 			close(us.wsCloseCh)
 
 			wg.Wait()
@@ -346,22 +349,27 @@ func TestWSReader(t *testing.T) {
 			wg.Wait()
 		})
 
-		t.Run("revoked session", func(_ *testing.T) {
+		// A transient GetSession error (e.g. DB blip during a pod roll) must not
+		// force-disconnect the session; the check is retried on the next tick.
+		t.Run("transient session lookup error", func(_ *testing.T) {
 			defer mockAPI.AssertExpectations(t)
 
 			us := newUserSession("userID", "channelID", "connID", "callID", false)
 
+			// First tick: transient error — must not disconnect.
 			mockAPI.On("GetSession", "authSessionID").Return(nil,
 				model.NewAppError("GetSessionById", "We encountered an error finding the session.", nil, "", http.StatusUnauthorized)).Once()
 
-			mockAPI.On("LogInfo", "invalid or expired session, closing RTC session",
+			mockAPI.On("LogWarn", "failed to get session, will retry",
 				"origin", mock.AnythingOfType("string"),
 				"channelID", us.channelID, "userID", us.userID, "connID", us.connID,
 				"err", "GetSessionById: We encountered an error finding the session.").Once()
 
-			mockAPI.On("LogDebug", "closeRTCSession",
-				"origin", mock.AnythingOfType("string"),
-				"userID", us.userID, "connID", us.connID, "channelID", us.channelID).Once()
+			// Second tick: succeeds — confirms wsReader retried rather than exiting.
+			secondCalled := make(chan struct{})
+			mockAPI.On("GetSession", "authSessionID").
+				Return(&model.Session{Id: "authSessionID"}, nil).
+				Run(func(_ mock.Arguments) { close(secondCalled) }).Once()
 
 			var wg sync.WaitGroup
 			wg.Add(1)
@@ -370,21 +378,22 @@ func TestWSReader(t *testing.T) {
 				p.wsReader(us, "authSessionID", "handlerID")
 			}()
 
-			time.Sleep(time.Second * 2)
+			// Wait until the second GetSession call fires, then tear down cleanly.
+			<-secondCalled
 			close(us.wsCloseCh)
 
 			wg.Wait()
 		})
 
 		// MM-64737 bug, which shouldn't happen but somehow did.
-		t.Run("nil session but nil error, revoke session, don't crash", func(_ *testing.T) {
+		t.Run("nil session but nil error, revoke session, don't crash", func(t *testing.T) {
 			defer mockAPI.AssertExpectations(t)
 
 			us := newUserSession("userID", "channelID", "connID", "callID", false)
 
 			mockAPI.On("GetSession", "authSessionID").Return(nil, nil).Once()
 
-			mockAPI.On("LogWarn", "no appErr and no session found",
+			mockAPI.On("LogWarn", "no session found",
 				"origin", mock.AnythingOfType("string"),
 				"channelID", us.channelID, "userID", us.userID, "connID", us.connID)
 
@@ -396,17 +405,22 @@ func TestWSReader(t *testing.T) {
 				"origin", mock.AnythingOfType("string"),
 				"userID", us.userID, "connID", us.connID, "channelID", us.channelID).Once()
 
-			var wg sync.WaitGroup
-			wg.Add(1)
+			doneCh := make(chan struct{})
 			go func() {
-				defer wg.Done()
+				defer close(doneCh)
 				p.wsReader(us, "authSessionID", "handlerID")
 			}()
 
-			time.Sleep(time.Second)
-			close(us.wsCloseCh)
-
-			wg.Wait()
+			select {
+			case <-doneCh:
+			case <-time.After(5 * time.Second):
+				close(us.wsCloseCh)
+				select {
+				case <-doneCh:
+				case <-time.After(time.Second):
+				}
+				t.Fatal("wsReader did not return within timeout")
+			}
 		})
 	})
 }
@@ -474,6 +488,170 @@ func TestHandleCallStateRequest(t *testing.T) {
 
 		err = p.handleCallStateRequest(channelID, userID, connID)
 		require.NoError(t, err)
+	})
+}
+
+func TestDeferredRTCSessionsCloser(t *testing.T) {
+	const rtcdHostIP = "127.0.0.1"
+
+	// Route through rtcd so the disconnects are observable, and so the closer has to carry the
+	// host it captured in order to reach the client.
+	newPlugin := func(t *testing.T) (*Plugin, *serverMocks.MockRTCDClient) {
+		t.Helper()
+
+		mockAPI := &pluginMocks.MockAPI{}
+		mockRTCDClient := &serverMocks.MockRTCDClient{}
+		t.Cleanup(func() { mockRTCDClient.AssertExpectations(t) })
+
+		p := &Plugin{
+			MattermostPlugin: plugin.MattermostPlugin{API: mockAPI},
+		}
+
+		store, tearDown := NewTestStore(t)
+		t.Cleanup(tearDown)
+		p.store = store
+
+		p.rtcdManager = &rtcdClientManager{
+			ctx:   p,
+			hosts: map[string]*rtcdHost{rtcdHostIP: {ip: rtcdHostIP, client: mockRTCDClient}},
+		}
+
+		mockLogs(mockAPI)
+
+		return p, mockRTCDClient
+	}
+
+	newCallState := func(t *testing.T, p *Plugin, connIDs ...string) *callState {
+		t.Helper()
+
+		call := &public.Call{
+			ID:        model.NewId(),
+			CreateAt:  time.Now().UnixMilli(),
+			ChannelID: model.NewId(),
+			StartAt:   time.Now().UnixMilli(),
+			PostID:    model.NewId(),
+			ThreadID:  model.NewId(),
+			OwnerID:   model.NewId(),
+			Props:     public.CallProps{RTCDHost: rtcdHostIP},
+		}
+		require.NoError(t, p.store.CreateCall(call))
+
+		state := &callState{Call: *call, sessions: map[string]*public.CallSession{}}
+		for _, connID := range connIDs {
+			state.sessions[connID] = &public.CallSession{
+				ID:     connID,
+				CallID: call.ID,
+				UserID: model.NewId(),
+			}
+		}
+
+		return state
+	}
+
+	// Matches the Leave message closeRTCSession sends for a specific session.
+	leaveFor := func(connID string) interface{} {
+		return mock.MatchedBy(func(msg rtcd.ClientMessage) bool {
+			data, ok := msg.Data.(map[string]string)
+			return ok && msg.Type == rtcd.ClientMessageLeave && data["sessionID"] == connID
+		})
+	}
+
+	t.Run("no sessions to close", func(t *testing.T) {
+		p, _ := newPlugin(t)
+		defer ResetTestStore(t, p.store)
+
+		state := newCallState(t, p)
+
+		// No Send expectations, so the strict mock catches a stray disconnect.
+		require.NoError(t, p.deferredRTCSessionsCloser(state, state.Call.ChannelID)())
+	})
+
+	t.Run("closes every session in the call", func(t *testing.T) {
+		p, mockRTCDClient := newPlugin(t)
+		defer ResetTestStore(t, p.store)
+
+		firstConnID, secondConnID := model.NewId(), model.NewId()
+		state := newCallState(t, p, firstConnID, secondConnID)
+
+		mockRTCDClient.On("Send", leaveFor(firstConnID)).Return(nil).Once()
+		mockRTCDClient.On("Send", leaveFor(secondConnID)).Return(nil).Once()
+
+		require.NoError(t, p.deferredRTCSessionsCloser(state, state.Call.ChannelID)())
+	})
+
+	t.Run("still routes to the right host once the ended call has been persisted", func(t *testing.T) {
+		p, mockRTCDClient := newPlugin(t)
+		defer ResetTestStore(t, p.store)
+
+		connID := model.NewId()
+		state := newCallState(t, p, connID)
+
+		// This is the regression the capture-then-close split guards: setCallEnded blanks
+		// Props.RTCDHost, so a closer that resolved the host at call time would have nothing left
+		// to route through by the time it runs.
+		closeSessions := p.deferredRTCSessionsCloser(state, state.Call.ChannelID)
+
+		setCallEnded(&state.Call)
+		require.NoError(t, p.store.UpdateCall(&state.Call))
+
+		mockRTCDClient.On("Send", leaveFor(connID)).Return(nil).Once()
+
+		require.NoError(t, closeSessions())
+	})
+
+	t.Run("closes the sessions captured, not the ones left in the state", func(t *testing.T) {
+		p, mockRTCDClient := newPlugin(t)
+		defer ResetTestStore(t, p.store)
+
+		connID := model.NewId()
+		state := newCallState(t, p, connID)
+
+		closeSessions := p.deferredRTCSessionsCloser(state, state.Call.ChannelID)
+
+		// Sessions are deleted before the closer runs, so it has to work off its own snapshot.
+		state.sessions = map[string]*public.CallSession{}
+
+		mockRTCDClient.On("Send", leaveFor(connID)).Return(nil).Once()
+
+		require.NoError(t, closeSessions())
+	})
+
+	t.Run("joins the failures and keeps closing the remaining sessions", func(t *testing.T) {
+		p, mockRTCDClient := newPlugin(t)
+		defer ResetTestStore(t, p.store)
+
+		failingConnID, healthyConnID := model.NewId(), model.NewId()
+		state := newCallState(t, p, failingConnID, healthyConnID)
+
+		mockRTCDClient.On("Send", leaveFor(failingConnID)).Return(fmt.Errorf("rtcd unreachable")).Once()
+		mockRTCDClient.On("Send", leaveFor(healthyConnID)).Return(nil).Once()
+
+		err := p.deferredRTCSessionsCloser(state, state.Call.ChannelID)()
+
+		// One failure must not stop the other session from being disconnected, and the error
+		// has to name the session that failed so a partial failure stays diagnosable.
+		require.Error(t, err)
+		require.ErrorContains(t, err, failingConnID)
+		require.ErrorContains(t, err, state.sessions[failingConnID].UserID)
+		require.ErrorContains(t, err, "rtcd unreachable")
+		require.NotContains(t, err.Error(), healthyConnID)
+	})
+
+	t.Run("names every session when they all fail", func(t *testing.T) {
+		p, mockRTCDClient := newPlugin(t)
+		defer ResetTestStore(t, p.store)
+
+		firstConnID, secondConnID := model.NewId(), model.NewId()
+		state := newCallState(t, p, firstConnID, secondConnID)
+
+		mockRTCDClient.On("Send", leaveFor(firstConnID)).Return(fmt.Errorf("rtcd unreachable")).Once()
+		mockRTCDClient.On("Send", leaveFor(secondConnID)).Return(fmt.Errorf("rtcd unreachable")).Once()
+
+		err := p.deferredRTCSessionsCloser(state, state.Call.ChannelID)()
+
+		require.Error(t, err)
+		require.ErrorContains(t, err, firstConnID)
+		require.ErrorContains(t, err, secondConnID)
 	})
 }
 
@@ -785,6 +963,7 @@ func TestHandleJoin(t *testing.T) {
 		sessions:               map[string]*session{},
 		addSessionsBatchers:    map[string]*batching.Batcher{},
 		removeSessionsBatchers: map[string]*batching.Batcher{},
+		dmNoAnswerTimers:       map[string]*time.Timer{},
 	}
 
 	p.licenseChecker = enterprise.NewLicenseChecker(p.API)
@@ -873,10 +1052,6 @@ func TestHandleJoin(t *testing.T) {
 			SkuShortName: "enterprise",
 		}, nil).Unset()
 
-		mockAPI.On("GetChannel", channelID).Return(&model.Channel{
-			Id:   channelID,
-			Type: model.ChannelTypeOpen,
-		}, nil).Once()
 		mockMetrics.On("IncWebSocketEvent", "out", wsEventCallStart).Once()
 		mockAPI.On("PublishWebSocketEvent", wsEventCallStart, mock.Anything,
 			&model.WebsocketBroadcast{ChannelId: channelID, ReliableClusterSend: true}).Once()
@@ -936,6 +1111,13 @@ func TestHandleJoin(t *testing.T) {
 		mockMetrics.On("IncWebSocketEvent", "out", wsEventUserLeft).Once()
 		mockAPI.On("PublishWebSocketEvent", wsEventUserLeft, map[string]any{"session_id": connID, "user_id": userID},
 			&model.WebsocketBroadcast{ChannelId: channelID, ReliableClusterSend: true}).Once()
+
+		// Only this one user ever joined, so removeUserSession checks the channel type to tell a
+		// cancelled DM call apart from one that ended normally.
+		mockAPI.On("GetChannel", channelID).Return(&model.Channel{
+			Id:   channelID,
+			Type: model.ChannelTypeOpen,
+		}, nil).Once()
 
 		mockAPI.On("UpdatePost", mock.AnythingOfType("*model.Post")).Return(&model.Post{Id: postID}, nil).Once()
 
@@ -1010,11 +1192,6 @@ func TestHandleJoin(t *testing.T) {
 				mockMetrics.On("IncWebSocketEvent", "out", wsEventCallStart).Once()
 				mockAPI.On("PublishWebSocketEvent", wsEventCallStart, mock.Anything,
 					&model.WebsocketBroadcast{ChannelId: channelID, ReliableClusterSend: true}).Once()
-
-				mockAPI.On("GetChannel", channelID).Return(&model.Channel{
-					Id:   channelID,
-					Type: model.ChannelTypeOpen,
-				}, nil).Once()
 			}
 
 			mockAPI.On("GetLicense").Return(&model.License{
@@ -1067,6 +1244,13 @@ func TestHandleJoin(t *testing.T) {
 		require.Len(t, state.sessions, 10)
 
 		// Session leaving call path
+
+		// removeUserSession calls GetChannel for DM auto-end check when sessions remain.
+		// Channel is open (not DM), so auto-end won't fire, but the call must be handled.
+		mockAPI.On("GetChannel", channelID).Return(&model.Channel{
+			Id:   channelID,
+			Type: model.ChannelTypeOpen,
+		}, nil)
 
 		mockMetrics.On("DecWebSocketConn").Times(10)
 		mockRTCMetrics.On("DecRTCSessions", "default").Times(10)
@@ -1158,10 +1342,6 @@ func TestHandleJoin(t *testing.T) {
 		defer mockMetrics.On("IncWebSocketEvent", "out", wsEventCallStart).Unset()
 		mockAPI.On("PublishWebSocketEvent", wsEventCallStart, mock.Anything,
 			&model.WebsocketBroadcast{ChannelId: channelID, ReliableClusterSend: true})
-		mockAPI.On("GetChannel", channelID).Return(&model.Channel{
-			Id:   channelID,
-			Type: model.ChannelTypeOpen,
-		}, nil)
 		mockAPI.On("GetLicense").Return(&model.License{
 			SkuShortName: "enterprise",
 		}, nil)
@@ -1336,13 +1516,11 @@ func TestHandleJoin(t *testing.T) {
 		mockAPI.On("GetChannel", channelID).Return(&model.Channel{
 			Id:   channelID,
 			Type: model.ChannelTypeDirect,
-		}, nil).Twice()
+		}, nil).Once()
 
 		mockAPI.On("GetChannelStats", channelID).Return(&model.ChannelStats{
 			MemberCount: 1,
 		}, nil).Once()
-
-		mockAPI.On("GetUsersInChannel", channelID, "username", 0, 8).Return(nil, nil)
 
 		// Call lock
 		mockAPI.On("KVSetWithOptions", "mutex_call_"+channelID, []byte{0x1}, mock.Anything).Return(true, nil)
@@ -1423,6 +1601,13 @@ func TestHandleJoin(t *testing.T) {
 		mockAPI.On("PublishWebSocketEvent", wsEventUserLeft, map[string]any{"session_id": connID, "user_id": userID},
 			&model.WebsocketBroadcast{ChannelId: channelID, ReliableClusterSend: true}).Once()
 
+		// This is a DM where only the caller ever joined, so removeUserSession looks the channel up
+		// to decide the call was cancelled rather than ended.
+		mockAPI.On("GetChannel", channelID).Return(&model.Channel{
+			Id:   channelID,
+			Type: model.ChannelTypeDirect,
+		}, nil).Once()
+
 		// Call unlock
 		mockAPI.On("KVDelete", "mutex_call_"+channelID).Return(nil).Once()
 
@@ -1434,4 +1619,338 @@ func TestHandleJoin(t *testing.T) {
 		// We need to give it some time as leaving happens in a goroutine.
 		time.Sleep(2 * time.Second)
 	})
+}
+
+// TestHandleClientMsgVideoStats guards against the MM-69233 regression: the
+// video on/off handler must persist Stats.HasUsedVideo and Props.VideoStartAt
+// via UpdateCall. Because every handler reloads call state from the DB
+// (lockCallReturnState -> getCallState), in-memory mutations that aren't
+// written back are lost on the next handler invocation, the leave path, and
+// call-end finalization — which is exactly how video metrics silently zeroed
+// out. The assertions deliberately re-read state from the store to exercise
+// that reload-from-DB boundary.
+func TestHandleClientMsgVideoStats(t *testing.T) {
+	mockAPI := &pluginMocks.MockAPI{}
+	mockMetrics := &serverMocks.MockMetrics{}
+
+	p := Plugin{
+		MattermostPlugin: plugin.MattermostPlugin{
+			API: mockAPI,
+		},
+		callsClusterLocks: map[string]*cluster.Mutex{},
+		metrics:           mockMetrics,
+		nodeID:            "nodeA",
+		sessions:          map[string]*session{},
+	}
+
+	store, tearDown := NewTestStore(t)
+	t.Cleanup(tearDown)
+	p.store = store
+
+	// The handler relays to another node (handlerID != nodeID), so it goes
+	// through the cluster message path rather than requiring a live RTC peer.
+	const handlerID = "nodeB"
+
+	mockAPI.On("LogDebug", "creating cluster mutex for call", "origin", mock.Anything, "channelID", mock.Anything)
+	mockAPI.On("KVSetWithOptions", mock.Anything, mock.Anything, mock.Anything).Return(true, nil)
+	mockAPI.On("KVDelete", mock.Anything).Return(nil)
+	mockAPI.On("PublishWebSocketEvent", mock.Anything, mock.Anything, mock.Anything)
+	mockAPI.On("PublishPluginClusterEvent", mock.Anything, mock.Anything).Return(nil)
+
+	mockMetrics.On("IncWebSocketEvent", mock.AnythingOfType("string"), mock.AnythingOfType("string"))
+	mockMetrics.On("IncClusterEvent", mock.AnythingOfType("string"))
+	mockMetrics.On("ObserveClusterMutexGrabTime", "mutex_call", mock.AnythingOfType("float64"))
+	mockMetrics.On("ObserveClusterMutexLockedTime", "mutex_call", mock.AnythingOfType("float64"))
+	mockMetrics.On("ObserveAppHandlersTime", mock.AnythingOfType("string"), mock.AnythingOfType("float64"))
+
+	// setupCall creates an active call with a single joined session and returns
+	// its identifiers.
+	setupCall := func(t *testing.T) (channelID, callID, connID, userID string) {
+		t.Helper()
+		channelID = model.NewId()
+		callID = model.NewId()
+		connID = model.NewId()
+		userID = model.NewId()
+
+		require.NoError(t, p.store.CreateCall(&public.Call{
+			ID:        callID,
+			CreateAt:  time.Now().UnixMilli(),
+			ChannelID: channelID,
+			StartAt:   time.Now().UnixMilli(),
+			PostID:    model.NewId(),
+			ThreadID:  model.NewId(),
+			OwnerID:   userID,
+		}))
+		require.NoError(t, p.store.CreateCallSession(&public.CallSession{
+			ID:     connID,
+			CallID: callID,
+			UserID: userID,
+			JoinAt: time.Now().UnixMilli(),
+		}))
+		return
+	}
+
+	t.Run("video on persists HasUsedVideo and VideoStartAt", func(t *testing.T) {
+		defer ResetTestStore(t, p.store)
+
+		channelID, callID, connID, userID := setupCall(t)
+		us := &session{
+			userID:         userID,
+			channelID:      channelID,
+			connID:         connID,
+			originalConnID: connID,
+			callID:         callID,
+		}
+
+		err := p.handleClientMsg(us, clientMessage{Type: clientMessageTypeVideoOn}, handlerID)
+		require.NoError(t, err)
+
+		// Re-read from the DB (fromWriter=false) to confirm the stats survived
+		// the reload boundary that previously discarded them.
+		state, err := p.getCallState(channelID, false)
+		require.NoError(t, err)
+		require.NotNil(t, state)
+		require.True(t, state.Call.Stats.HasUsedVideo, "HasUsedVideo must be persisted")
+		require.NotNil(t, state.Call.Props.VideoStartAt)
+		require.Greater(t, state.Call.Props.VideoStartAt[connID], int64(0), "VideoStartAt must be persisted")
+		require.True(t, state.sessions[connID].Video, "session video flag must be persisted")
+	})
+
+	t.Run("video off accumulates and persists VideoDuration", func(t *testing.T) {
+		defer ResetTestStore(t, p.store)
+
+		channelID, callID, connID, userID := setupCall(t)
+
+		// Simulate a video that was turned on 10 seconds ago and persisted, as
+		// the video_on handler would have done.
+		call, err := p.store.GetActiveCallByChannelID(channelID, db.GetCallOpts{})
+		require.NoError(t, err)
+		call.Stats.HasUsedVideo = true
+		call.Props.VideoStartAt = map[string]int64{connID: time.Now().Unix() - 10}
+		require.NoError(t, p.store.UpdateCall(call))
+
+		sess, err := p.store.GetCallSession(connID, db.GetCallSessionOpts{})
+		require.NoError(t, err)
+		sess.Video = true
+		require.NoError(t, p.store.UpdateCallSession(sess))
+
+		us := &session{
+			userID:         userID,
+			channelID:      channelID,
+			connID:         connID,
+			originalConnID: connID,
+			callID:         callID,
+		}
+
+		err = p.handleClientMsg(us, clientMessage{Type: clientMessageTypeVideoOff}, handlerID)
+		require.NoError(t, err)
+
+		state, err := p.getCallState(channelID, false)
+		require.NoError(t, err)
+		require.NotNil(t, state)
+		require.True(t, state.Call.Stats.HasUsedVideo, "HasUsedVideo must remain set")
+		require.Greater(t, state.Call.Stats.VideoDuration, int64(0), "VideoDuration must be accumulated and persisted")
+		require.NotContains(t, state.Call.Props.VideoStartAt, connID, "VideoStartAt entry must be cleared on video off")
+		require.False(t, state.sessions[connID].Video, "session video flag must be cleared")
+	})
+}
+
+func TestHandleReconnect(t *testing.T) {
+	mockAPI := &pluginMocks.MockAPI{}
+	mockMetrics := &serverMocks.MockMetrics{}
+
+	p := Plugin{
+		MattermostPlugin: plugin.MattermostPlugin{
+			API: mockAPI,
+		},
+		callsClusterLocks: map[string]*cluster.Mutex{},
+		metrics:           mockMetrics,
+		sessions:          map[string]*session{},
+	}
+
+	store, tearDown := NewTestStore(t)
+	t.Cleanup(tearDown)
+	p.store = store
+
+	// log.go prepends "origin"+value, so handleReconnect's opening LogDebug has 13 args.
+	mockAPI.On("LogDebug", mock.Anything, mock.Anything, mock.Anything,
+		mock.Anything, mock.Anything, mock.Anything, mock.Anything,
+		mock.Anything, mock.Anything, mock.Anything, mock.Anything,
+		mock.Anything, mock.Anything)
+	mockAPI.On("KVSetWithOptions", mock.Anything, mock.Anything, mock.Anything).Return(true, nil)
+	mockMetrics.On("ObserveClusterMutexGrabTime", "mutex_call", mock.AnythingOfType("float64"))
+	mockMetrics.On("ObserveClusterMutexLockedTime", "mutex_call", mock.AnythingOfType("float64"))
+	mockMetrics.On("ObserveAppHandlersTime", mock.AnythingOfType("string"), mock.AnythingOfType("float64"))
+
+	channelID := model.NewId()
+	userID := model.NewId()
+	connID := model.NewId()
+	originalConnID := model.NewId()
+	prevConnID := model.NewId()
+
+	t.Run("forbidden", func(t *testing.T) {
+		mockAPI.On("HasPermissionToChannel", userID, channelID, model.PermissionCreatePost).Return(false).Once()
+		err := p.handleReconnect(userID, connID, channelID, originalConnID, prevConnID, "")
+		require.EqualError(t, err, "forbidden")
+	})
+
+	t.Run("no call ongoing", func(t *testing.T) {
+		mockAPI.On("HasPermissionToChannel", userID, channelID, model.PermissionCreatePost).Return(true).Once()
+		err := p.handleReconnect(userID, connID, channelID, originalConnID, prevConnID, "")
+		require.EqualError(t, err, "no call ongoing")
+	})
+
+	t.Run("session not found in call state", func(t *testing.T) {
+		defer ResetTestStore(t, p.store)
+
+		callID := model.NewId()
+		require.NoError(t, p.store.CreateCall(&public.Call{
+			ID:        callID,
+			CreateAt:  time.Now().UnixMilli(),
+			ChannelID: channelID,
+			StartAt:   time.Now().UnixMilli(),
+			PostID:    model.NewId(),
+			ThreadID:  model.NewId(),
+			OwnerID:   userID,
+		}))
+
+		mockAPI.On("HasPermissionToChannel", userID, channelID, model.PermissionCreatePost).Return(true).Once()
+		err := p.handleReconnect(userID, connID, channelID, originalConnID, prevConnID, "")
+		require.EqualError(t, err, "session not found in call state")
+	})
+
+	t.Run("session belongs to different user", func(t *testing.T) {
+		defer ResetTestStore(t, p.store)
+
+		callID := model.NewId()
+		require.NoError(t, p.store.CreateCall(&public.Call{
+			ID:        callID,
+			CreateAt:  time.Now().UnixMilli(),
+			ChannelID: channelID,
+			StartAt:   time.Now().UnixMilli(),
+			PostID:    model.NewId(),
+			ThreadID:  model.NewId(),
+			OwnerID:   userID,
+		}))
+		require.NoError(t, p.store.CreateCallSession(&public.CallSession{
+			ID:     originalConnID,
+			CallID: callID,
+			UserID: model.NewId(), // different user owns this session
+			JoinAt: time.Now().UnixMilli(),
+		}))
+
+		mockAPI.On("HasPermissionToChannel", userID, channelID, model.PermissionCreatePost).Return(true).Once()
+		err := p.handleReconnect(userID, connID, channelID, originalConnID, prevConnID, "")
+		require.EqualError(t, err, "session not found in call state")
+	})
+
+	t.Run("already reconnected", func(t *testing.T) {
+		defer ResetTestStore(t, p.store)
+
+		callID := model.NewId()
+		require.NoError(t, p.store.CreateCall(&public.Call{
+			ID:        callID,
+			CreateAt:  time.Now().UnixMilli(),
+			ChannelID: channelID,
+			StartAt:   time.Now().UnixMilli(),
+			PostID:    model.NewId(),
+			ThreadID:  model.NewId(),
+			OwnerID:   userID,
+		}))
+		require.NoError(t, p.store.CreateCallSession(&public.CallSession{
+			ID:     originalConnID,
+			CallID: callID,
+			UserID: userID,
+			JoinAt: time.Now().UnixMilli(),
+		}))
+
+		// Session in memory with wsReconnected already set to 1.
+		p.mut.Lock()
+		p.sessions[connID] = &session{
+			userID:    userID,
+			channelID: channelID,
+			connID:    connID,
+			callID:    callID,
+		}
+		atomic.StoreInt32(&p.sessions[connID].wsReconnected, 1)
+		p.mut.Unlock()
+		defer func() {
+			p.mut.Lock()
+			delete(p.sessions, connID)
+			p.mut.Unlock()
+		}()
+
+		mockAPI.On("HasPermissionToChannel", userID, channelID, model.PermissionCreatePost).Return(true).Once()
+		err := p.handleReconnect(userID, connID, channelID, originalConnID, prevConnID, "")
+		require.EqualError(t, err, "session already reconnected")
+	})
+}
+
+func TestWebSocketMessageHasBeenPostedReconnectError(t *testing.T) {
+	mockAPI := &pluginMocks.MockAPI{}
+	mockMetrics := &serverMocks.MockMetrics{}
+
+	p := Plugin{
+		MattermostPlugin: plugin.MattermostPlugin{
+			API: mockAPI,
+		},
+		callsClusterLocks: map[string]*cluster.Mutex{},
+		metrics:           mockMetrics,
+		sessions:          map[string]*session{},
+	}
+
+	store, tearDown := NewTestStore(t)
+	t.Cleanup(tearDown)
+	p.store = store
+
+	// log.go prepends "origin"+value, so handleReconnect's opening LogDebug has 13 args.
+	mockAPI.On("LogDebug", mock.Anything, mock.Anything, mock.Anything,
+		mock.Anything, mock.Anything, mock.Anything, mock.Anything,
+		mock.Anything, mock.Anything, mock.Anything, mock.Anything,
+		mock.Anything, mock.Anything).Maybe()
+	// LogWarn also prepends "origin"+value (2 extra args).
+	mockAPI.On("LogWarn", mock.Anything, mock.Anything, mock.Anything, mock.Anything,
+		mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything,
+		mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything,
+		mock.Anything).Maybe()
+	// Mutex-related mocks are not exercised in the reconnect error path.
+	mockAPI.On("KVSetWithOptions", mock.Anything, mock.Anything, mock.Anything).Return(true, nil).Maybe()
+	mockMetrics.On("ObserveClusterMutexGrabTime", "mutex_call", mock.AnythingOfType("float64")).Maybe()
+	mockMetrics.On("ObserveClusterMutexLockedTime", "mutex_call", mock.AnythingOfType("float64")).Maybe()
+	mockMetrics.On("ObserveAppHandlersTime", mock.AnythingOfType("string"), mock.AnythingOfType("float64"))
+
+	channelID := model.NewId()
+	userID := model.NewId()
+	connID := model.NewId()
+	originalConnID := model.NewId()
+	prevConnID := model.NewId()
+
+	mockAPI.On("HasPermissionToChannel", userID, channelID, model.PermissionCreatePost).Return(true).Once()
+
+	// wsEventError must be published back to the failing client.
+	published := make(chan struct{})
+	mockMetrics.On("IncWebSocketEvent", "out", wsEventError).Once()
+	mockAPI.On("PublishWebSocketEvent", wsEventError,
+		map[string]interface{}{"data": "no call ongoing", "connID": connID},
+		&model.WebsocketBroadcast{ConnectionId: connID, ReliableClusterSend: true},
+	).Run(func(_ mock.Arguments) { close(published) }).Return().Once()
+
+	p.WebSocketMessageHasBeenPosted(connID, userID, &model.WebSocketRequest{
+		Action: wsActionPrefix + clientMessageTypeReconnect,
+		Data: map[string]interface{}{
+			"channelID":      channelID,
+			"originalConnID": originalConnID,
+			"prevConnID":     prevConnID,
+		},
+		Session: model.Session{Id: model.NewId()},
+	})
+
+	select {
+	case <-published:
+	case <-time.After(5 * time.Second):
+		t.Fatal("wsEventError was not published after reconnect failure")
+	}
+
+	mockAPI.AssertExpectations(t)
+	mockMetrics.AssertExpectations(t)
 }

@@ -6,6 +6,7 @@
 const exec = require('child_process').exec;
 const path = require('path');
 
+const TerserPlugin = require('terser-webpack-plugin');
 const webpack = require('webpack');
 
 const PLUGIN_ID = require('../plugin.json').id;
@@ -47,7 +48,7 @@ if (NPM_TARGET === 'build:watch' || NPM_TARGET === 'debug:watch') {
 
 module.exports = {
     entry: [
-        './src/index.tsx',
+        './src/entry.tsx',
     ],
     resolve: {
         alias: {
@@ -56,6 +57,9 @@ module.exports = {
             '@mattermost/client': path.resolve(__dirname, './mattermost-webapp/webapp/platform/client/src/'),
             'mattermost-redux': path.resolve(__dirname, './mattermost-webapp/webapp/channels/src/packages/mattermost-redux/src/'),
             reselect: path.resolve(__dirname, './mattermost-webapp/webapp/channels/src/packages/mattermost-redux/src/selectors/create_selector/index'),
+
+            // Force CommonJS build to avoid ES module minification issues
+            '@mediapipe/tasks-vision': path.resolve(__dirname, './node_modules/@mediapipe/tasks-vision/vision_bundle.cjs'),
         },
         modules: [
             'src',
@@ -121,10 +125,18 @@ module.exports = {
     output: {
         devtoolNamespace: PLUGIN_ID,
         path: path.join(__dirname, '/dist'),
-        publicPath: '/',
+        publicPath: '',
         filename: 'main.js',
+        chunkFilename: 'chunk.[contenthash].js',
+        clean: true,
+        asyncChunks: false, // This is needed or the plugin blundle won't load properly.
     },
     devtool,
     mode,
     plugins,
+    optimization: {
+        minimizer: [
+            new TerserPlugin(),
+        ],
+    },
 };

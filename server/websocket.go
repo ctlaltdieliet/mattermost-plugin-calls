@@ -34,6 +34,8 @@ const (
 	wsEventUserVoiceOff              = "user_voice_off"
 	wsEventUserScreenOn              = "user_screen_on"
 	wsEventUserScreenOff             = "user_screen_off"
+	wsEventUserVideoOn               = "user_video_on"
+	wsEventUserVideoOff              = "user_video_off"
 	wsEventCallStart                 = "call_start"
 	wsEventCallState                 = "call_state"
 	wsEventCallEnd                   = "call_end"
@@ -167,13 +169,6 @@ func (p *Plugin) handleClientMessageTypeScreen(us *session, msg clientMessage, h
 		return fmt.Errorf("screen sharing is not allowed")
 	}
 
-	data := map[string]string{}
-	if msg.Type == clientMessageTypeScreenOn {
-		if err := json.Unmarshal(msg.Data, &data); err != nil {
-			return err
-		}
-	}
-
 	state, err := p.lockCallReturnState(us.channelID)
 	if err != nil {
 		return fmt.Errorf("failed to lock call: %w", err)
@@ -189,6 +184,11 @@ func (p *Plugin) handleClientMessageTypeScreen(us *session, msg clientMessage, h
 		}
 		state.Call.Props.ScreenSharingSessionID = us.originalConnID
 		state.Call.Props.ScreenStartAt = time.Now().Unix()
+
+		// Mark that this call has used screen sharing (only set once per call)
+		if !state.Call.Stats.HasUsedScreenShare {
+			state.Call.Stats.HasUsedScreenShare = true
+		}
 	} else {
 		if state.Call.Props.ScreenSharingSessionID != us.originalConnID {
 			return fmt.Errorf("cannot stop screen sharing, someone else is sharing already: connID=%s", state.Call.Props.ScreenSharingSessionID)
@@ -200,6 +200,9 @@ func (p *Plugin) handleClientMessageTypeScreen(us *session, msg clientMessage, h
 		}
 	}
 
+	// Props.ScreenSharingSessionID and ScreenStartAt must be persisted on every
+	// toggle: getCallState reloads from the DB on each handler invocation, so
+	// without this write the next screen_on/screen_off would see stale state.
 	if err := p.store.UpdateCall(&state.Call); err != nil {
 		return fmt.Errorf("failed to update call: %w", err)
 	}
@@ -376,6 +379,95 @@ func (p *Plugin) handleClientMsg(us *session, msg clientMessage, handlerID strin
 		if err := p.handleClientMessageTypeScreen(us, msg, handlerID); err != nil {
 			return err
 		}
+	case clientMessageTypeVideoOn, clientMessageTypeVideoOff:
+		if handlerID != p.nodeID {
+			// need to relay track event.
+			if err := p.sendClusterMessage(clusterMessage{
+				ConnID:        us.originalConnID,
+				UserID:        us.userID,
+				ChannelID:     us.channelID,
+				CallID:        us.callID,
+				SenderID:      p.nodeID,
+				ClientMessage: msg,
+			}, clusterMessageTypeUserState, handlerID); err != nil {
+				return err
+			}
+		} else {
+			msgType := rtc.VideoOnMessage
+			if msg.Type == clientMessageTypeVideoOff {
+				msgType = rtc.VideoOffMessage
+			}
+
+			rtcMsg := rtc.Message{
+				SessionID: us.originalConnID,
+				Type:      msgType,
+				Data:      msg.Data,
+			}
+
+			if err := p.sendRTCMessage(rtcMsg, us.callID); err != nil {
+				return fmt.Errorf("failed to send RTC message: %w", err)
+			}
+		}
+
+		state, err := p.lockCallReturnState(us.channelID)
+		if err != nil {
+			return fmt.Errorf("failed to lock call: %w", err)
+		}
+		defer p.unlockCall(us.channelID)
+		if state == nil {
+			return fmt.Errorf("channel state is missing from store")
+		}
+		session := state.sessions[us.originalConnID]
+		if session == nil {
+			return fmt.Errorf("user session is missing from call state")
+		}
+
+		// Track video duration statistics
+		if msg.Type == clientMessageTypeVideoOn {
+			// Video turned on - record the start time
+			session.Video = true
+			if state.Call.Props.VideoStartAt == nil {
+				state.Call.Props.VideoStartAt = make(map[string]int64)
+			}
+			state.Call.Props.VideoStartAt[us.originalConnID] = time.Now().Unix()
+
+			// Mark that this call has used video (only set once per call)
+			if !state.Call.Stats.HasUsedVideo {
+				state.Call.Stats.HasUsedVideo = true
+			}
+		} else {
+			// Video turned off - accumulate the duration
+			session.Video = false
+			if state.Call.Props.VideoStartAt != nil {
+				if startTime, exists := state.Call.Props.VideoStartAt[us.originalConnID]; exists && startTime > 0 {
+					state.Call.Stats.VideoDuration += secondsSinceTimestamp(startTime)
+					delete(state.Call.Props.VideoStartAt, us.originalConnID)
+				}
+			}
+		}
+
+		if err := p.store.UpdateCallSession(session); err != nil {
+			return fmt.Errorf("failed to update call session: %w", err)
+		}
+
+		// Persist HasUsedVideo and VideoStartAt: getCallState reloads from the DB
+		// each invocation, so without this write the stats are lost (MM-69233).
+		if err := p.store.UpdateCall(&state.Call); err != nil {
+			return fmt.Errorf("failed to update call: %w", err)
+		}
+
+		evType := wsEventUserVideoOn
+		if msg.Type == clientMessageTypeVideoOff {
+			evType = wsEventUserVideoOff
+		}
+		p.publishWebSocketEvent(evType, map[string]interface{}{
+			"userID":     us.userID,
+			"session_id": us.originalConnID,
+		}, &WebSocketBroadcast{
+			ChannelID:           us.channelID,
+			ReliableClusterSend: true,
+			UserIDs:             getUserIDsFromSessions(state.sessions),
+		})
 	case clientMessageTypeRaiseHand, clientMessageTypeUnraiseHand:
 		evType := wsEventUserUnraiseHand
 		if msg.Type == clientMessageTypeRaiseHand {
@@ -506,7 +598,15 @@ func (p *Plugin) wsReader(us *session, authSessionID, handlerID string) {
 			}
 
 			s, appErr := p.API.GetSession(authSessionID)
-			if appErr != nil || s == nil || (s.ExpiresAt != 0 && time.Now().UnixMilli() >= s.ExpiresAt) {
+			if appErr != nil {
+				// A lookup error (e.g. transient DB failure during a pod roll) is not
+				// the same as a definitively revoked or expired session. Skip this tick
+				// and retry on the next interval rather than force-disconnecting.
+				p.LogWarn("failed to get session, will retry", "channelID", us.channelID, "userID", us.userID, "connID", us.connID, "err", appErr.Error())
+				continue
+			}
+
+			if s == nil || (s.ExpiresAt != 0 && time.Now().UnixMilli() >= s.ExpiresAt) {
 				fields := []any{
 					"channelID",
 					us.channelID,
@@ -516,10 +616,8 @@ func (p *Plugin) wsReader(us *session, authSessionID, handlerID string) {
 					us.connID,
 				}
 
-				if appErr == nil && s == nil {
-					p.LogWarn("no appErr and no session found", fields...)
-				} else if appErr != nil {
-					fields = append(fields, "err", appErr.Error())
+				if s == nil {
+					p.LogWarn("no session found", fields...)
 				} else {
 					fields = append(fields, "sessionID", s.Id, "expiresAt", fmt.Sprintf("%d", s.ExpiresAt))
 				}
@@ -714,7 +812,7 @@ func (p *Plugin) handleJoin(userID, connID, authSessionID string, joinData calls
 				)
 			}
 
-			postID, threadID, err := p.createCallStartedPost(state, userID, channelID, joinData.Title, joinData.ThreadID)
+			postID, threadID, err := p.createCallStartedPost(state, userID, channelID, joinData.Title, joinData.ThreadID, channel.Type)
 			if err != nil {
 				p.LogError(err.Error())
 			}
@@ -723,6 +821,10 @@ func (p *Plugin) handleJoin(userID, connID, authSessionID string, joinData calls
 			state.Call.ThreadID = threadID
 			if err := p.store.UpdateCall(&state.Call); err != nil {
 				p.LogError(err.Error())
+			}
+
+			if channel.Type == model.ChannelTypeDirect {
+				p.startDMNoAnswerTimer(channelID, state.Call.ID)
 			}
 
 			// TODO: send all the info attached to a call.
@@ -735,6 +837,12 @@ func (p *Plugin) handleJoin(userID, connID, authSessionID string, joinData calls
 				"owner_id":  state.Call.OwnerID,
 				"host_id":   state.Call.GetHostID(),
 			}, &WebSocketBroadcast{ChannelID: channelID, ReliableClusterSend: true})
+		}
+
+		if !p.isBot(userID) && channel.Type == model.ChannelTypeDirect {
+			if len(state.distinctNonBotUserIDs(p.getBotID())) >= 2 {
+				p.cancelDMNoAnswerTimer(channelID)
+			}
 		}
 
 		p.LogDebug("session has joined call",
@@ -960,7 +1068,7 @@ func (p *Plugin) handleReconnect(userID, connID, channelID, originalConnID, prev
 		return fmt.Errorf("forbidden")
 	}
 
-	state, err := p.getCallState(channelID, false)
+	state, err := p.getCallState(channelID, true)
 	if err != nil {
 		return err
 	} else if state == nil {
@@ -1201,6 +1309,10 @@ func (p *Plugin) WebSocketMessageHasBeenPosted(connID, userID string, req *model
 			if err := p.handleReconnect(userID, connID, channelID, originalConnID, prevConnID, req.Session.Id); err != nil {
 				p.LogWarn(err.Error(), "userID", userID, "connID", connID,
 					"originalConnID", originalConnID, "prevConnID", prevConnID, "channelID", channelID)
+				p.publishWebSocketEvent(wsEventError, map[string]interface{}{
+					"data":   err.Error(),
+					"connID": connID,
+				}, &WebSocketBroadcast{ConnectionID: connID, ReliableClusterSend: true})
 			}
 		}()
 		return
@@ -1246,7 +1358,7 @@ func (p *Plugin) WebSocketMessageHasBeenPosted(connID, userID string, req *model
 			return
 		}
 		msg.Data = data
-	case clientMessageTypeICE, clientMessageTypeScreenOn:
+	case clientMessageTypeICE, clientMessageTypeScreenOn, clientMessageTypeVideoOn:
 		msgData, ok := req.Data["data"].(string)
 		if !ok {
 			p.LogError("invalid or missing data")
@@ -1310,7 +1422,47 @@ func (p *Plugin) WebSocketMessageHasBeenPosted(connID, userID string, req *model
 	}
 }
 
+// deferredRTCSessionsCloser captures everything needed to force-close every session in the call
+// before setCallEnded wipes Props.NodeID and Props.RTCDHost, and returns the disconnect work to be
+// run later.
+// Force-closing is only a fallback for clients that don't act on call_end, so the returned function
+// must not run until the call lock has been released — on the embedded RTC server path
+// closeRTCSession synchronously invokes the session close callback, which re-enters removeSession
+// and takes the same non-reentrant mutex — and until clients have had a chance to leave on their
+// own. See forceCloseRTCSessionsAfterGrace.
+func (p *Plugin) deferredRTCSessionsCloser(state *callState, channelID string) func() error {
+	nodeID := state.Call.Props.NodeID
+	callID := state.Call.ID
+	rtcdHost := state.Call.Props.RTCDHost
+
+	type sessionInfo struct {
+		userID, connID string
+	}
+	sessionInfos := make([]sessionInfo, 0, len(state.sessions))
+	for connID, session := range state.sessions {
+		sessionInfos = append(sessionInfos, sessionInfo{userID: session.UserID, connID: connID})
+	}
+
+	return func() error {
+		var errs []error
+		for _, si := range sessionInfos {
+			if err := p.closeRTCSessionWithHost(si.userID, si.connID, channelID, nodeID, callID, rtcdHost); err != nil {
+				errs = append(errs, fmt.Errorf("failed to close RTC session (userID=%s, connID=%s): %w", si.userID, si.connID, err))
+			}
+		}
+
+		return errors.Join(errs...)
+	}
+}
+
 func (p *Plugin) closeRTCSession(userID, connID, channelID, handlerID, callID string) error {
+	return p.closeRTCSessionWithHost(userID, connID, channelID, handlerID, callID, "")
+}
+
+// closeRTCSessionWithHost is closeRTCSession with an explicitly provided RTCD host. Callers that
+// disconnect sessions after the call has been marked as ended must pass one, since setCallEnded
+// clears Props.RTCDHost and there would be nothing left to look up in the store.
+func (p *Plugin) closeRTCSessionWithHost(userID, connID, channelID, handlerID, callID, rtcdHost string) error {
 	p.LogDebug("closeRTCSession", "userID", userID, "connID", connID, "channelID", channelID)
 	if p.rtcServer != nil {
 		if handlerID == p.nodeID {
@@ -1336,9 +1488,13 @@ func (p *Plugin) closeRTCSession(userID, connID, channelID, handlerID, callID st
 			},
 		}
 
-		host, err := p.store.GetRTCDHostForCall(callID, db.GetCallOpts{})
-		if err != nil {
-			return fmt.Errorf("failed to get RTCD host for call: %w", err)
+		host := rtcdHost
+		if host == "" {
+			var err error
+			host, err = p.store.GetRTCDHostForCall(callID, db.GetCallOpts{})
+			if err != nil {
+				return fmt.Errorf("failed to get RTCD host for call: %w", err)
+			}
 		}
 
 		if err := p.rtcdManager.Send(msg, host); err != nil {

@@ -33,7 +33,11 @@ func (p *Plugin) NotificationWillBePushed(notification *model.PushNotification, 
 	// 1. This is a call start post
 	// 2. We have enabled ringing
 	// 3. The channel is a DM or GM
-	if notification.PostType != callStartPostType || !*p.getConfiguration().EnableRinging {
+	if notification.PostType != callEventPostType {
+		return nil, ""
+	}
+	cfg := p.getConfiguration()
+	if cfg.EnableRinging == nil || !*cfg.EnableRinging {
 		return nil, ""
 	}
 
@@ -67,6 +71,11 @@ func (p *Plugin) NotificationWillBePushed(notification *model.PushNotification, 
 }
 
 func (p *Plugin) sendPushNotifications(channelID, createdPostID, threadID string, sender *model.User, config *model.Config) {
+	cfg := p.getConfiguration()
+	if cfg.EnableRinging == nil || !*cfg.EnableRinging {
+		return
+	}
+
 	if err := p.canSendPushNotifications(config, p.API.GetLicense()); err != nil {
 		return
 	}
@@ -102,6 +111,7 @@ func (p *Plugin) sendPushNotifications(channelID, createdPostID, threadID string
 			Version:     model.PushMessageV2,
 			Type:        model.PushTypeMessage,
 			SubType:     model.PushSubTypeCalls,
+			Transport:   model.PushTransportVoIP,
 			TeamId:      channel.TeamId,
 			ChannelId:   channelID,
 			PostId:      createdPostID,

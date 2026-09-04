@@ -2,7 +2,7 @@
 // See LICENSE.txt for license information.
 
 import React, {CSSProperties, useRef, useState} from 'react';
-import {Overlay} from 'react-bootstrap';
+import {Overlay, OverlayProps} from 'react-bootstrap';
 import {StyledTooltip} from 'src/components/shared';
 import Shortcut from 'src/components/shortcut';
 import styled, {css} from 'styled-components';
@@ -16,7 +16,7 @@ export type Props = {
     bgColorHover?: string,
     tooltipText?: string,
     tooltipSubtext?: string,
-    tooltipPosition?: string,
+    tooltipPosition?: OverlayProps['placement'],
     onToggle?: () => void,
     unavailable?: boolean,
     disabled?: boolean,
@@ -41,7 +41,7 @@ export default function WidgetButton(props: Props) {
                 id={props.id}
                 onMouseOver={() => setShow(true)}
                 onMouseOut={() => setShow(false)}
-                className='cursor--pointer style--none'
+                className={props.disabled ? 'style--none' : 'cursor--pointer style--none'}
                 // eslint-disable-next-line no-undefined
                 onClick={props.disabled ? undefined : props.onToggle}
                 disabled={props.disabled}
@@ -106,11 +106,21 @@ const Button = styled.button<{$bgColor: string, $bgColorHover?: string, $isDisab
   &&& {
     padding: 5px;
     background-color: ${({$bgColor}) => $bgColor};
+  }
 
-    ${({$isDisabled, $isUnavailable}) => ($isDisabled || $isUnavailable) && css`
-      :hover {
-        background-color: transparent;
+  &&&&& {
+    ${({$isDisabled, $isUnavailable, $bgColor}) => ($isDisabled || $isUnavailable) && css`
+      &:hover {
+        background: ${$bgColor || 'transparent'};
       }
+    `}
+
+    ${({$isDisabled}) => $isDisabled && css`
+      color: rgba(var(--center-channel-color-rgb), 0.32);
+      svg {
+        fill: rgba(var(--center-channel-color-rgb), 0.32);
+      }
+      cursor: not-allowed;
     `}
   }
 `;

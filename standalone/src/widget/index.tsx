@@ -8,24 +8,32 @@ import {getMe} from 'mattermost-redux/actions/users';
 import {getChannel} from 'mattermost-redux/selectors/entities/channels';
 import {getCurrentUserLocale} from 'mattermost-redux/selectors/entities/i18n';
 import {getTeams} from 'mattermost-redux/selectors/entities/teams';
+import {getCurrentUserId} from 'mattermost-redux/selectors/entities/users';
 import {isOpenChannel, isPrivateChannel} from 'mattermost-redux/utils/channel_utils';
+import {
+    USER_MUTED,
+    USER_UNMUTED,
+    USER_VIDEO_OFF,
+    USER_VIDEO_ON,
+} from 'plugin/action_types';
 import CallWidget from 'plugin/components/call_widget';
 import {
     logDebug,
-    logErr,
 } from 'plugin/log';
 import {Store} from 'plugin/types/mattermost-webapp';
 import {
-    fetchTranslationsFile,
+    getTranslations,
     playSound, sendDesktopError,
     sendDesktopEvent,
 } from 'plugin/utils';
 import React from 'react';
-import ReactDOM from 'react-dom';
+import {createRoot, Root} from 'react-dom/client';
 import {IntlProvider} from 'react-intl';
 import {Provider} from 'react-redux';
 
 import init, {InitCbProps} from '../init';
+
+let widgetRoot: Root | null = null;
 
 async function initWidget({store, startingCall}: InitCbProps) {
     if (window.desktopAPI?.getAppInfo) {
@@ -50,32 +58,70 @@ async function initWidget({store, startingCall}: InitCbProps) {
 
     const locale = getCurrentUserLocale(store.getState()) || 'en';
 
-    let messages;
-    if (locale !== 'en') {
-        try {
-            messages = await fetchTranslationsFile(locale);
-        } catch (err) {
-            logErr('failed to fetch translations files', err);
-        }
-    }
+    window.callsClient?.on('mute', () => {
+        store.dispatch({
+            type: USER_MUTED,
+            data: {
+                channelID: window.callsClient?.channelID,
+                userID: getCurrentUserId(store.getState()),
+                session_id: window.callsClient?.getSessionID(),
+            },
+        });
+    });
 
-    ReactDOM.render(
-        <Provider store={store}>
-            <IntlProvider
-                locale={locale}
-                key={locale}
-                defaultLocale='en'
-                messages={messages}
-            >
-                <CallWidget
-                    global={true}
-                    startingCall={startingCall}
-                    position={{bottom: 4, left: 2}}
-                />
-            </IntlProvider>
-        </Provider>,
-        document.getElementById('root'),
-    );
+    window.callsClient?.on('unmute', () => {
+        store.dispatch({
+            type: USER_UNMUTED,
+            data: {
+                channelID: window.callsClient?.channelID,
+                userID: getCurrentUserId(store.getState()),
+                session_id: window.callsClient?.getSessionID(),
+            },
+        });
+    });
+
+    window.callsClient?.on('video_on', () => {
+        store.dispatch({
+            type: USER_VIDEO_ON,
+            data: {
+                channelID: window.callsClient?.channelID,
+                userID: getCurrentUserId(store.getState()),
+                session_id: window.callsClient?.getSessionID(),
+            },
+        });
+    });
+
+    window.callsClient?.on('video_off', () => {
+        store.dispatch({
+            type: USER_VIDEO_OFF,
+            data: {
+                channelID: window.callsClient?.channelID,
+                userID: getCurrentUserId(store.getState()),
+                session_id: window.callsClient?.getSessionID(),
+            },
+        });
+    });
+
+    const rootEl = document.getElementById('root');
+    if (rootEl) {
+        widgetRoot = createRoot(rootEl);
+        widgetRoot.render(
+            <Provider store={store}>
+                <IntlProvider
+                    locale={locale}
+                    key={locale}
+                    defaultLocale='en'
+                    messages={getTranslations(locale)}
+                >
+                    <CallWidget
+                        global={true}
+                        startingCall={startingCall}
+                        position={{bottom: 4, left: 2}}
+                    />
+                </IntlProvider>
+            </Provider>,
+        );
+    }
 }
 
 async function initStoreWidget(store: Store, channelID: string) {
@@ -114,10 +160,8 @@ function deinitWidget(err?: Error) {
     setTimeout(() => {
         window.callsClient?.destroy();
         delete window.callsClient;
-        const el = document.getElementById('root');
-        if (el) {
-            ReactDOM.unmountComponentAtNode(el);
-        }
+        widgetRoot?.unmount();
+        widgetRoot = null;
 
         if (window.desktopAPI?.leaveCall) {
             logDebug('desktopAPI.leaveCall');

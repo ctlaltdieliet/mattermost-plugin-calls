@@ -23,6 +23,7 @@ import {
     UserReactionData,
     UserRemovedData,
     UserScreenOnOffData,
+    UserVideoOnOffData,
     UserVoiceOnOffData,
 } from '@mattermost/calls-common/lib/types';
 import {WebSocketMessage} from '@mattermost/client/websocket';
@@ -35,6 +36,7 @@ import {
     loadCallState,
     loadProfilesByIdsIfMissing,
     removeIncomingCallNotification,
+    setDMCalleeAnsweredAt,
     userLeft,
 } from 'src/actions';
 import {userLeftChannelErr, userRemovedFromChannelErr} from 'src/client';
@@ -72,13 +74,18 @@ import {
     USER_SCREEN_OFF,
     USER_SCREEN_ON,
     USER_UNMUTED,
+    USER_VIDEO_OFF,
+    USER_VIDEO_ON,
     USER_VOICE_OFF,
     USER_VOICE_ON,
 } from './action_types';
-import {logErr} from './log';
+import {logErr, logInfo} from './log';
 import {
     calls,
     channelIDForCurrentCall,
+    dmCalleeAnsweredAtForCurrentCall,
+    idForCurrentCall,
+    isCurrentUserOwnerOfCurrentCall,
     profilesInCurrentCallMap,
     ringingEnabled,
     shouldPlayJoinUserSound,
@@ -87,8 +94,11 @@ import {Store} from './types/mattermost-webapp';
 import {
     followThread,
     getCallsClient,
+    getCallsClientChannelID,
     getCallsClientSessionID,
+    getCallsWindow,
     getUserDisplayName,
+    isDMChannel,
     notificationsStopRinging,
     playSound,
 } from './utils';
@@ -115,6 +125,10 @@ export function handleCallState(store: Store, ev: WebSocketMessage<CallStateData
 // state mutating operations.
 export function handleCallStart(store: Store, ev: WebSocketMessage<CallStartData>) {
     const channelID = ev.data.channelID || ev.broadcast.channel_id;
+    const callID = ev.data.id;
+
+    // Log the callID for debugging
+    logInfo(`call_start: callID=${callID}, channelID=${channelID}`);
 
     // Clear the old recording and live captions state (if any).
     store.dispatch({
@@ -135,7 +149,7 @@ export function handleCallStart(store: Store, ev: WebSocketMessage<CallStartData
     store.dispatch({
         type: CALL_STATE,
         data: {
-            ID: ev.data.id,
+            ID: callID,
             channelID,
             startAt: ev.data.start_at,
             ownerID: ev.data.owner_id,
@@ -159,7 +173,7 @@ export function handleCallStart(store: Store, ev: WebSocketMessage<CallStartData
         }
     } else if (ringingEnabled(store.getState())) {
         // the call that started is not the call we're currently in.
-        store.dispatch(incomingCallOnChannel(channelID, ev.data.id, ev.data.owner_id, ev.data.start_at));
+        store.dispatch(incomingCallOnChannel(channelID, callID, ev.data.owner_id, ev.data.start_at));
     }
 }
 
@@ -181,16 +195,48 @@ export function handleUserJoined(store: Store, ev: WebSocketMessage<UserJoinedDa
 
     if (window.callsClient?.channelID === channelID) {
         if (sessionID === getCallsClientSessionID()) {
-            playSound('join_self');
+            // The DM caller hears the outbound ringback instead of the join self sound
+            const dmCallerWillHearRingback = ringingEnabled(store.getState()) &&
+                isDMChannel(getChannel(store.getState(), channelID)) &&
+                isCurrentUserOwnerOfCurrentCall(store.getState());
+
+            if (!dmCallerWillHearRingback) {
+                playSound('join_self');
+            }
         } else if (userID !== currentUserID && shouldPlayJoinUserSound(store.getState())) {
             playSound('join_user');
         }
     }
 
-    if (ringingEnabled(store.getState()) && userID === currentUserID) {
+    if (userID === currentUserID) {
+        // Log when current user joins (for debugging)
         const callID = calls(store.getState())[channelID]?.ID || '';
-        store.dispatch(removeIncomingCallNotification(callID));
-        notificationsStopRinging(); // And stop ringing for _any_ incoming call.
+        logInfo(`user_joined (self): sessionID=${sessionID}, channelID=${channelID}, callID=${callID}`);
+
+        if (ringingEnabled(store.getState())) {
+            store.dispatch(removeIncomingCallNotification(callID));
+            notificationsStopRinging(); // And stop ringing for _any_ incoming call.
+        }
+    }
+
+    // A DM call is answered the moment the other party joins, which is where its duration
+    // should start counting from. Only the caller needs to observe this: the callee's own answer
+    // moment is their join, which we get from the calls client instead (see
+    // callTimerStartAtForCurrentCall).
+    const currentCallID = idForCurrentCall(store.getState());
+    if (currentCallID && getCallsClientChannelID() === channelID && userID !== currentUserID &&
+        isDMChannel(getChannel(store.getState(), channelID)) &&
+        isCurrentUserOwnerOfCurrentCall(store.getState()) &&
+        !dmCalleeAnsweredAtForCurrentCall(store.getState())) {
+        const answeredAt = Date.now();
+        store.dispatch(setDMCalleeAnsweredAt(currentCallID, answeredAt));
+
+        // Keep a copy in the window so expanded view can pick it up
+        // as soon as its opened. We later sync it to its store in CallStatusTimer.
+        const callsWindow = getCallsWindow();
+        if (callsWindow.currentCallData) {
+            callsWindow.currentCallData.dmCalleeAnsweredAt = answeredAt;
+        }
     }
 
     // This is async, which is expected as we are okay with setting the state while we wait
@@ -377,13 +423,23 @@ export function handleCallHostChanged(store: Store, ev: WebSocketMessage<CallHos
         },
     });
 
+    // When a DM caller initiates a call, they are set as host immediately,
+    // which is redundant with the calling state.The server sends this event
+    // before call_start; at this stage, we don't have call info yet, indicating that we are the initiator.
+    if (
+        ev.data.hostID === getCurrentUserId(store.getState()) &&
+        isDMChannel(getChannel(store.getState(), channelID)) &&
+        !calls(store.getState())[channelID]) {
+        return;
+    }
+
     const hostProfile = profilesInCurrentCallMap(store.getState())[ev.data.hostID] ||
         getUser(store.getState(), ev.data.hostID);
     if (!hostProfile) {
         return;
     }
-    const displayName = getUserDisplayName(hostProfile);
 
+    const displayName = getUserDisplayName(hostProfile);
     const hostNotice: HostControlNotice = {
         type: HostControlNoticeType.HostChanged,
         callID: ev.data.call_id,
@@ -608,4 +664,28 @@ export function handleHostRemoved(store: Store, ev: WebSocketMessage<HostControl
             },
         });
     }, HOST_CONTROL_NOTICE_TIMEOUT);
+}
+
+export function handleUserVideoOn(store: Store, ev: WebSocketMessage<UserVideoOnOffData>) {
+    const channelID = ev.data.channelID || ev.broadcast.channel_id;
+    store.dispatch({
+        type: USER_VIDEO_ON,
+        data: {
+            channelID,
+            userID: ev.data.userID,
+            session_id: ev.data.session_id,
+        },
+    });
+}
+
+export function handleUserVideoOff(store: Store, ev: WebSocketMessage<UserVideoOnOffData>) {
+    const channelID = ev.data.channelID || ev.broadcast.channel_id;
+    store.dispatch({
+        type: USER_VIDEO_OFF,
+        data: {
+            channelID,
+            userID: ev.data.userID,
+            session_id: ev.data.session_id,
+        },
+    });
 }

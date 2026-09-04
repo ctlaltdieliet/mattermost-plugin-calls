@@ -38,7 +38,7 @@ export default function JoinNotification(props: Props) {
         <FormattedMessage
             defaultMessage={'<b>You\'re muted.</b> Select {muteIcon} to unmute.'}
             values={{
-                b: (text: string) => <b>{text}</b>,
+                b: (text: React.ReactNode) => <b>{text}</b>,
                 muteIcon,
             }}
         />);
@@ -46,14 +46,14 @@ export default function JoinNotification(props: Props) {
         <FormattedMessage
             defaultMessage={'<b>You\'re unmuted.</b> Select {muteIcon} to mute.'}
             values={{
-                b: (text: string) => <b>{text}</b>,
+                b: (text: React.ReactNode) => <b>{text}</b>,
                 muteIcon,
             }}
         />);
 
     return (
         <div
-            className='calls-notification-bar calls-slide-top'
+            className='calls-notification-bar slideFadeInOutAnimation'
             data-testid={'calls-widget-on-join-notification'}
             onAnimationEnd={onAnimationEnd}
         >

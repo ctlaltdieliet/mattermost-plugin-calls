@@ -84,6 +84,7 @@ type UserStateClient struct {
 	UserID     string `json:"user_id"`
 	Unmuted    bool   `json:"unmuted"`
 	RaisedHand int64  `json:"raised_hand"`
+	Video      bool   `json:"video"`
 }
 
 type CallStateClient struct {
@@ -248,6 +249,7 @@ func (cs *callState) getStates(botID string) []UserStateClient {
 			UserID:     session.UserID,
 			Unmuted:    session.Unmuted,
 			RaisedHand: session.RaisedHand,
+			Video:      session.Video,
 		})
 	}
 	return states
@@ -262,6 +264,17 @@ func (cs *callState) onlyUserLeft(userID string) bool {
 		found = true
 	}
 	return found
+}
+
+func (cs *callState) distinctNonBotUserIDs(botID string) map[string]struct{} {
+	users := make(map[string]struct{}, len(cs.sessions))
+	for _, session := range cs.sessions {
+		if session.UserID == botID {
+			continue
+		}
+		users[session.UserID] = struct{}{}
+	}
+	return users
 }
 
 func (p *Plugin) getCallStateFromCall(call *public.Call, fromWriter bool) (*callState, error) {
@@ -357,7 +370,7 @@ func (p *Plugin) cleanCallState(call *public.Call) error {
 		return nil
 	}
 
-	if _, err := p.updateCallPostEnded(call.PostID, mapKeys(call.Props.Participants)); err != nil {
+	if _, err := p.updateCallPostEnded(call.PostID, mapKeys(call.Props.Participants), callEndReasonNormal); err != nil {
 		p.LogError("failed to update call post", "err", err.Error())
 	}
 

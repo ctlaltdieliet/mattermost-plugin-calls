@@ -5,7 +5,7 @@
   "homepage_url": "https://github.com/mattermost/mattermost-plugin-calls/",
   "support_url": "https://github.com/mattermost/mattermost-plugin-calls/issues",
   "icon_path": "assets/plugin_icon.svg",
-  "min_server_version": "10.0.0",
+  "min_server_version": "11.0.0",
   "server": {
     "executables": {
       "linux-amd64": "server/dist/plugin-linux-amd64",
@@ -77,6 +77,13 @@
             "type": "bool",
             "default": false,
             "help_text": "When set to true, clients will use WebRTC data channels for signaling of new media tracks. This can result in a more efficient and less race-prone process, especially in case of frequent WebSocket disconnections."
+          },
+          {
+            "key": "EnableVideo",
+            "display_name": "Enable video calls in DMs (Experimental)",
+            "type": "bool",
+            "default": false,
+            "help_text": "When set to true, video calls are enabled in direct message channels."
           }
         ]
       },
@@ -712,13 +719,20 @@
         "type": "bool",
         "default": false,
         "help_text": "When set to true, clients will use WebRTC data channels for signaling of new media tracks. This can result in a more efficient and less race-prone process, especially in case of frequent WebSocket disconnections."
+      },
+      {
+        "key": "EnableVideo",
+        "display_name": "Enable video calls in DMs (Experimental)",
+        "type": "bool",
+        "default": false,
+        "help_text": "When set to true, video calls are enabled in direct message channels."
       }
     ]
   },
   "props": {
     "min_rtcd_version": "v0.17.0",
     "min_offloader_version": "v0.9.0",
-    "calls_recorder_version": "v0.8.8",
-    "calls_transcriber_version": "v0.7.1"
+    "calls_recorder_version": "v0.8.13",
+    "calls_transcriber_version": "v0.7.2"
   }
 }

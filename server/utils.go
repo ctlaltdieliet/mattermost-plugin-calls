@@ -27,9 +27,14 @@ import (
 
 const (
 	channelNameMaxLength = 24
+	// sdpDataMaxSize is the maximum allowed size of a decompressed SDP payload.
+	// Legitimate SDP offers/answers are a few KB; 64 KB is a generous upper bound.
+	sdpDataMaxSize = 64 * 1024
 )
 
-var filenameSanitizationRE = regexp.MustCompile(`[\\:*?\"<>|\n\s/]`)
+// filenameSanitizationRE matches any character NOT in the allowlist.
+// This prevents Markdown/HTML injection when filenames are embedded in Markdown.
+var filenameSanitizationRE = regexp.MustCompile(`[^a-zA-Z0-9._\-]`)
 
 func (p *Plugin) getNotificationNameFormat(userID string) string {
 	config := p.API.GetConfig()
@@ -97,9 +102,12 @@ func unpackSDPData(data []byte) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to create reader: %w", err)
 	}
-	unpacked, err := io.ReadAll(rd)
+	unpacked, err := io.ReadAll(io.LimitReader(rd, sdpDataMaxSize+1))
 	if err != nil {
 		return nil, fmt.Errorf("failed to read data: %w", err)
+	}
+	if len(unpacked) > sdpDataMaxSize {
+		return nil, fmt.Errorf("decompressed SDP data exceeds maximum allowed size")
 	}
 	return unpacked, nil
 }
@@ -169,9 +177,10 @@ func (p *Plugin) genFilenameForCall(channelID string) (filename string) {
 		return
 	}
 
-	if channel.Type == model.ChannelTypeOpen || channel.Type == model.ChannelTypePrivate {
+	switch channel.Type {
+	case model.ChannelTypeOpen, model.ChannelTypePrivate:
 		name = channel.DisplayName
-	} else if channel.Type == model.ChannelTypeDirect || channel.Type == model.ChannelTypeGroup {
+	case model.ChannelTypeDirect, model.ChannelTypeGroup:
 		users, appErr := p.API.GetUsersInChannel(channel.Id, model.ChannelSortByUsername, 0, 8)
 		if appErr != nil {
 			p.LogError("failed to get channel users", "err", appErr.Error())

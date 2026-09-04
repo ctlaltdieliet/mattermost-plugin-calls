@@ -30,6 +30,7 @@ import {
     DID_NOTIFY_FOR_CALL,
     DID_RING_FOR_CALL,
     DISMISS_CALL,
+    DM_CALLEE_ANSWERED_AT,
     HIDE_EXPANDED_VIEW,
     HIDE_SCREEN_SOURCE_MODAL,
     HIDE_SWITCH_CALL_MODAL,
@@ -65,6 +66,8 @@ import {
     USER_SCREEN_OFF,
     USER_SCREEN_ON,
     USER_UNMUTED,
+    USER_VIDEO_OFF,
+    USER_VIDEO_ON,
     USER_VOICE_OFF,
     USER_VOICE_ON,
     USERS_STATES,
@@ -182,6 +185,7 @@ const sessions = (state: sessionsState = {}, action: sessionsAction) => {
                     user_id: action.data.userID,
                     unmuted: false,
                     voice: false,
+                    video: false,
                     raised_hand: 0,
                 },
             },
@@ -211,6 +215,7 @@ const sessions = (state: sessionsState = {}, action: sessionsAction) => {
                         user_id: action.data.userID,
                         unmuted: false,
                         voice: false,
+                        video: false,
                         raised_hand: 0,
                     },
                 },
@@ -236,6 +241,7 @@ const sessions = (state: sessionsState = {}, action: sessionsAction) => {
                         user_id: action.data.userID,
                         unmuted: true,
                         voice: false,
+                        video: false,
                         raised_hand: 0,
                     },
                 },
@@ -261,6 +267,7 @@ const sessions = (state: sessionsState = {}, action: sessionsAction) => {
                         user_id: action.data.userID,
                         unmuted: false,
                         voice: true,
+                        video: false,
                         raised_hand: 0,
                     },
                 },
@@ -286,6 +293,7 @@ const sessions = (state: sessionsState = {}, action: sessionsAction) => {
                         user_id: action.data.userID,
                         unmuted: false,
                         voice: false,
+                        video: false,
                         raised_hand: 0,
                     },
                 },
@@ -311,6 +319,7 @@ const sessions = (state: sessionsState = {}, action: sessionsAction) => {
                         user_id: action.data.userID,
                         unmuted: false,
                         voice: false,
+                        video: false,
                         raised_hand: action.data.raised_hand,
                     },
                 },
@@ -336,6 +345,7 @@ const sessions = (state: sessionsState = {}, action: sessionsAction) => {
                         user_id: action.data.userID,
                         voice: false,
                         unmuted: false,
+                        video: false,
                         raised_hand: action.data.raised_hand,
                     },
                 },
@@ -362,6 +372,7 @@ const sessions = (state: sessionsState = {}, action: sessionsAction) => {
                         voice: false,
                         unmuted: false,
                         raised_hand: 0,
+                        video: false,
                         reaction: action.data.reaction,
                     },
                 },
@@ -396,6 +407,58 @@ const sessions = (state: sessionsState = {}, action: sessionsAction) => {
             },
         };
     }
+    case USER_VIDEO_ON:
+        if (!state[action.data.channelID]) {
+            return {
+                ...state,
+                [action.data.channelID]: {
+                    [action.data.session_id]: {
+                        session_id: action.data.session_id,
+                        user_id: action.data.userID,
+                        unmuted: false,
+                        voice: false,
+                        raised_hand: 0,
+                        video: true,
+                    },
+                },
+            };
+        }
+        return {
+            ...state,
+            [action.data.channelID]: {
+                ...state[action.data.channelID],
+                [action.data.session_id]: {
+                    ...state[action.data.channelID][action.data.session_id],
+                    video: true,
+                },
+            },
+        };
+    case USER_VIDEO_OFF:
+        if (!state[action.data.channelID]) {
+            return {
+                ...state,
+                [action.data.channelID]: {
+                    [action.data.session_id]: {
+                        session_id: action.data.session_id,
+                        user_id: action.data.userID,
+                        unmuted: true,
+                        voice: false,
+                        raised_hand: 0,
+                        video: false,
+                    },
+                },
+            };
+        }
+        return {
+            ...state,
+            [action.data.channelID]: {
+                ...state[action.data.channelID],
+                [action.data.session_id]: {
+                    ...state[action.data.channelID][action.data.session_id],
+                    video: false,
+                },
+            },
+        };
     default:
         return state;
     }
@@ -678,6 +741,37 @@ const hosts = (state: hostsState = {}, action: hostsStateAction) => {
                 hostChangeAt: action.data.hostChangeAt,
             },
         };
+    default:
+        return state;
+    }
+};
+
+export type DmCalleeAnsweredAt = {
+    [callID: string]: number;
+}
+
+type DmCalleeAnsweredAtAction = {
+    type: string;
+    data: {
+        callID: string;
+        answeredAt: number;
+    };
+}
+
+const dmCalleeAnsweredAt = (state: DmCalleeAnsweredAt = {}, action: DmCalleeAnsweredAtAction) => {
+    switch (action.type) {
+    case UNINIT:
+        return {};
+    case DM_CALLEE_ANSWERED_AT:
+        return {
+            ...state,
+            [action.data.callID]: action.data.answeredAt,
+        };
+    case CALL_END: {
+        const nextState = {...state};
+        delete nextState[action.data.callID];
+        return nextState;
+    }
     default:
         return state;
     }
@@ -1019,6 +1113,7 @@ export default combineReducers({
     sessions,
     calls,
     hosts,
+    dmCalleeAnsweredAt,
     screenSharingIDs,
     expandedView,
     switchCallModal,

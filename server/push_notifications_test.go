@@ -18,6 +18,114 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestSendPushNotificationsRingingDisabled(t *testing.T) {
+	mockAPI := &pluginMocks.MockAPI{}
+
+	store, tearDown := NewTestStore(t)
+	t.Cleanup(tearDown)
+
+	p := Plugin{
+		MattermostPlugin: plugin.MattermostPlugin{
+			API: mockAPI,
+		},
+		store: store,
+	}
+
+	mockAPI.On("GetLicense").Return(&model.License{}, nil).Times(2)
+
+	var cfg configuration
+	cfg.SetDefaults()
+	*cfg.EnableRinging = false
+	err := p.setConfiguration(cfg.Clone())
+	require.NoError(t, err)
+
+	var serverConfig model.Config
+	serverConfig.SetDefaults()
+
+	// SendPushNotification must never be called when ringing is disabled.
+	// If the guard is missing, the VoIP/CallKit push would be sent regardless.
+	p.sendPushNotifications(model.NewId(), model.NewId(), model.NewId(), &model.User{Id: model.NewId()}, &serverConfig)
+
+	mockAPI.AssertNotCalled(t, "SendPushNotification")
+}
+
+func TestSendPushNotificationsRingingNil(t *testing.T) {
+	mockAPI := &pluginMocks.MockAPI{}
+
+	store, tearDown := NewTestStore(t)
+	t.Cleanup(tearDown)
+
+	p := Plugin{
+		MattermostPlugin: plugin.MattermostPlugin{
+			API: mockAPI,
+		},
+		store: store,
+	}
+
+	mockAPI.On("GetLicense").Return(&model.License{}, nil).Times(2)
+
+	var cfg configuration
+	cfg.SetDefaults()
+	cfg.EnableRinging = nil
+	err := p.setConfiguration(cfg.Clone())
+	require.NoError(t, err)
+
+	var serverConfig model.Config
+	serverConfig.SetDefaults()
+
+	// SendPushNotification must not be called when EnableRinging is unset (nil).
+	p.sendPushNotifications(model.NewId(), model.NewId(), model.NewId(), &model.User{Id: model.NewId()}, &serverConfig)
+
+	mockAPI.AssertNotCalled(t, "SendPushNotification")
+}
+
+func TestSendPushNotificationsRingingEnabled(t *testing.T) {
+	mockAPI := &pluginMocks.MockAPI{}
+
+	store, tearDown := NewTestStore(t)
+	t.Cleanup(tearDown)
+
+	p := Plugin{
+		MattermostPlugin: plugin.MattermostPlugin{
+			API: mockAPI,
+		},
+		store: store,
+	}
+
+	// 2 calls inside setOverrides + 1 eager arg to canSendPushNotifications
+	mockAPI.On("GetLicense").Return(&model.License{}, nil).Times(3)
+
+	var cfg configuration
+	cfg.SetDefaults()
+	*cfg.EnableRinging = true
+	err := p.setConfiguration(cfg.Clone())
+	require.NoError(t, err)
+
+	senderID := model.NewId()
+	receiverID := model.NewId()
+	channelID := model.NewId()
+	postID := model.NewId()
+	threadID := model.NewId()
+
+	sender := &model.User{Id: senderID, Username: "sender"}
+	receiver := &model.User{Id: receiverID, Username: "receiver"}
+	channel := &model.Channel{Id: channelID, Type: model.ChannelTypeDirect}
+
+	var serverConfig model.Config
+	serverConfig.SetDefaults()
+
+	mockAPI.On("GetChannel", channelID).Return(channel, nil).Once()
+	mockAPI.On("GetUsersInChannel", channelID, model.ChannelSortByUsername, 0, 8).Return([]*model.User{sender, receiver}, nil).Once()
+	mockAPI.On("GetUser", receiverID).Return(receiver, nil).Once()
+	mockAPI.On("GetConfig").Return(&serverConfig).Once()
+	mockAPI.On("GetPreferencesForUser", receiverID).Return([]model.Preference{}, nil).Once()
+	mockAPI.On("SendPushNotification", mock.Anything, receiverID).Return(nil).Once()
+
+	p.sendPushNotifications(channelID, postID, threadID, sender, &serverConfig)
+
+	mockAPI.AssertExpectations(t)
+}
+
 func TestNotificationWillBePushed(t *testing.T) {
 	mockAPI := &pluginMocks.MockAPI{}
 
@@ -123,7 +231,7 @@ func TestNotificationWillBePushed(t *testing.T) {
 			require.False(t, *p.getConfiguration().EnableRinging)
 
 			res, msg := p.NotificationWillBePushed(&model.PushNotification{
-				PostType: callStartPostType,
+				PostType: callEventPostType,
 			}, "userID")
 			require.Nil(t, res)
 			require.Empty(t, msg)
@@ -136,14 +244,14 @@ func TestNotificationWillBePushed(t *testing.T) {
 			require.True(t, *p.getConfiguration().EnableRinging)
 
 			res, msg := p.NotificationWillBePushed(&model.PushNotification{
-				PostType:    callStartPostType,
+				PostType:    callEventPostType,
 				ChannelType: model.ChannelTypeDirect,
 			}, "userID")
 			require.Nil(t, res)
 			require.Equal(t, "calls plugin will handle this notification", msg)
 
 			res, msg = p.NotificationWillBePushed(&model.PushNotification{
-				PostType:    callStartPostType,
+				PostType:    callEventPostType,
 				ChannelType: model.ChannelTypeGroup,
 			}, "userID")
 			require.Nil(t, res)
@@ -168,12 +276,12 @@ func TestNotificationWillBePushed(t *testing.T) {
 			}, nil).Once()
 
 			res, msg := p.NotificationWillBePushed(&model.PushNotification{
-				PostType:    callStartPostType,
+				PostType:    callEventPostType,
 				ChannelType: model.ChannelTypeOpen,
 				SenderId:    "senderID",
 			}, "receiverID")
 			require.Equal(t, &model.PushNotification{
-				PostType:    callStartPostType,
+				PostType:    callEventPostType,
 				ChannelType: model.ChannelTypeOpen,
 				SenderId:    "senderID",
 				Message:     "\u200bapp.push_notification.inviting_message",
@@ -182,13 +290,13 @@ func TestNotificationWillBePushed(t *testing.T) {
 
 			t.Run("id loaded", func(t *testing.T) {
 				res, msg := p.NotificationWillBePushed(&model.PushNotification{
-					PostType:    callStartPostType,
+					PostType:    callEventPostType,
 					ChannelType: model.ChannelTypeOpen,
 					SenderId:    "senderID",
 					IsIdLoaded:  true,
 				}, "receiverID")
 				require.Equal(t, &model.PushNotification{
-					PostType:    callStartPostType,
+					PostType:    callEventPostType,
 					ChannelType: model.ChannelTypeOpen,
 					SenderId:    "senderID",
 					IsIdLoaded:  true,

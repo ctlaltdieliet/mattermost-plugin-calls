@@ -1,7 +1,9 @@
 // Copyright (c) 2020-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
-/* eslint-disable-file max-lines */
+/* eslint-disable max-lines */
+
+import './expanded_view.scss';
 
 import {mosThreshold} from '@mattermost/calls-common';
 import {UserSessionState} from '@mattermost/calls-common/lib/types';
@@ -10,15 +12,17 @@ import {Post} from '@mattermost/types/posts';
 import {Team} from '@mattermost/types/teams';
 import {UserProfile} from '@mattermost/types/users';
 import {IDMappedObjects} from '@mattermost/types/utilities';
+import {Client4} from 'mattermost-redux/client';
 import {Theme} from 'mattermost-redux/selectors/entities/preferences';
 import {MediaControlBar, MediaController, MediaFullscreenButton} from 'media-chrome/dist/react';
-import React from 'react';
+import React, {useEffect, useState} from 'react';
 import {OverlayTrigger, Tooltip} from 'react-bootstrap';
 import {IntlShape} from 'react-intl';
 import {RouteComponentProps} from 'react-router-dom';
 import {hostMuteOthers, hostRemove} from 'src/actions';
+import Avatar from 'src/components/avatar/avatar';
 import {Badge} from 'src/components/badge';
-import CallDuration from 'src/components/call_widget/call_duration';
+import {CallStatusTimer} from 'src/components/call_status_timer';
 import DotMenu, {DotMenuButton, DropdownMenu} from 'src/components/dot_menu/dot_menu';
 import CallParticipantRHS from 'src/components/expanded_view/call_participant_rhs';
 import {LiveCaptionsStream} from 'src/components/expanded_view/live_captions_stream';
@@ -29,6 +33,7 @@ import {
 import ChatThreadIcon from 'src/components/icons/chat_thread';
 import CollapseIcon from 'src/components/icons/collapse';
 import CompassIcon from 'src/components/icons/compassIcon';
+import GridViewIcon from 'src/components/icons/grid_view';
 import LeaveCallIcon from 'src/components/icons/leave_call_icon';
 import MutedIcon from 'src/components/icons/muted_icon';
 import ParticipantsIcon from 'src/components/icons/participants';
@@ -36,12 +41,15 @@ import RecordCircleIcon from 'src/components/icons/record_circle';
 import RecordSquareIcon from 'src/components/icons/record_square';
 import ScreenIcon from 'src/components/icons/screen_icon';
 import ShareScreenIcon from 'src/components/icons/share_screen';
+import SpeakerViewIcon from 'src/components/icons/speaker_view';
 import UnmutedIcon from 'src/components/icons/unmuted_icon';
 import UnshareScreenIcon from 'src/components/icons/unshare_screen';
+import VideoOffIcon from 'src/components/icons/video_off';
+import VideoOnIcon from 'src/components/icons/video_on';
 import {ExpandedIncomingCallContainer} from 'src/components/incoming_calls/expanded_incoming_call_container';
 import {LeaveCallMenu} from 'src/components/leave_call_menu';
 import {ReactionStream} from 'src/components/reaction_stream/reaction_stream';
-import {CallAlertConfigs, DEGRADED_CALL_QUALITY_ALERT_WAIT} from 'src/constants';
+import {CallAlertConfigs, DEGRADED_CALL_QUALITY_ALERT_WAIT, STORAGE_CALLS_MIRROR_VIDEO_KEY} from 'src/constants';
 import {logDebug, logErr} from 'src/log';
 import {
     keyToAction,
@@ -57,10 +65,10 @@ import {
 } from 'src/shortcuts';
 import {ModalData} from 'src/types/mattermost-webapp';
 import {
-    AudioDevices,
     CallAlertStates,
     CallAlertStatesDefault,
     CallJobReduxState,
+    MediaDevices,
     RemoveConfirmationData,
 } from 'src/types/types';
 import {
@@ -73,12 +81,13 @@ import {
     shareAudioWithScreen,
     untranslatable,
 } from 'src/utils';
+import {serverDismissedAt} from 'src/utils/clock_skew';
 import styled, {createGlobalStyle, css} from 'styled-components';
 
 import {CallSettingsButton} from './call_settings';
 import ControlsButton, {CallThreadIcon, MentionsCounter, UnreadDot} from './controls_button';
 import GlobalBanner from './global_banner';
-import ParticipantsGrid from './participants_grid';
+import {ParticipantsGrid} from './participants_grid';
 import {ReactionButton, ReactionButtonRef} from './reaction_button';
 import RecordingInfoPrompt from './recording_info_prompt';
 import {RemoveConfirmation} from './remove_confirmation';
@@ -93,7 +102,6 @@ interface Props extends RouteComponentProps {
     sessions: UserSessionState[],
     sessionsMap: { [sessionID: string]: UserSessionState },
     currentSession?: UserSessionState,
-    callStartAt: number,
     callHostID: string,
     callHostChangeAt: number,
     callRecording?: CallJobReduxState,
@@ -122,14 +130,21 @@ interface Props extends RouteComponentProps {
     isAdmin: boolean,
     hostControlsAllowed: boolean,
     openModal: <P>(modalData: ModalData<P>) => void;
+    enableVideo: boolean;
+    otherSessions: UserSessionState[];
+    isDMCalling: boolean;
+    clientConnecting: boolean;
 }
 
 interface State {
     screenStream: MediaStream | null,
+    selfVideoStream: MediaStream | null,
+    otherVideoStream: MediaStream | null,
     showParticipantsList: boolean,
     showLiveCaptions: boolean,
     alerts: CallAlertStates,
     removeConfirmation: RemoveConfirmationData | null,
+    viewState: 'grid' | 'speaker',
 }
 
 const StyledMediaController = styled(MediaController)`
@@ -161,6 +176,7 @@ export default class ExpandedView extends React.PureComponent<Props, State> {
     private callQualityBannerLocked = false;
 
     static contextType = window.ProductApi.WebSocketProvider;
+    declare context: React.ContextType<typeof window.ProductApi.WebSocketProvider>;
 
     #unlockNavigation?: () => void;
 
@@ -276,10 +292,13 @@ export default class ExpandedView extends React.PureComponent<Props, State> {
         this.emojiButtonRef = React.createRef();
         this.state = {
             screenStream: null,
+            selfVideoStream: null,
+            otherVideoStream: null,
             showParticipantsList: false,
             showLiveCaptions: false,
             alerts: CallAlertStatesDefault,
             removeConfirmation: null,
+            viewState: 'speaker',
         };
 
         if (window.opener) {
@@ -412,7 +431,7 @@ export default class ExpandedView extends React.PureComponent<Props, State> {
         }
     };
 
-    setAudioDevices = (devices: AudioDevices) => {
+    setAudioDevices = (devices: MediaDevices) => {
         this.setState({
             alerts: {
                 ...this.state.alerts,
@@ -420,6 +439,19 @@ export default class ExpandedView extends React.PureComponent<Props, State> {
                     ...this.state.alerts.missingAudioInput,
                     active: devices.inputs.length === 0,
                     show: devices.inputs.length === 0,
+                },
+            },
+        });
+    };
+
+    setVideoDevices = (devices: MediaDeviceInfo[]) => {
+        this.setState({
+            alerts: {
+                ...this.state.alerts,
+                missingVideoInput: {
+                    ...this.state.alerts.missingVideoInput,
+                    active: devices.length === 0,
+                    show: devices.length === 0,
                 },
             },
         });
@@ -442,14 +474,31 @@ export default class ExpandedView extends React.PureComponent<Props, State> {
         }
         const callsClient = getCallsClient();
         if (this.isMuted()) {
+            logDebug('ExpandedView.onMuteToggle: unmuting (user toggled on)');
             callsClient?.unmute();
         } else {
+            logDebug('ExpandedView.onMuteToggle: muting (user toggled off)');
             callsClient?.mute();
+        }
+    };
+
+    onVideoToggle = () => {
+        const callsClient = getCallsClient();
+        if (this.isVideoOn()) {
+            logDebug('ExpandedView.onVideoToggle: stopping video (user toggled off)');
+            callsClient?.stopVideo();
+        } else {
+            logDebug('ExpandedView.onVideoToggle: starting video (user toggled on)');
+            callsClient?.startVideo();
         }
     };
 
     isMuted() {
         return this.props.currentSession ? !this.props.currentSession.unmuted : true;
+    }
+
+    isVideoOn() {
+        return this.props.currentSession ? this.props.currentSession.video : false;
     }
 
     isHandRaised() {
@@ -536,6 +585,12 @@ export default class ExpandedView extends React.PureComponent<Props, State> {
         this.props.hideExpandedView();
     };
 
+    onSwitchViewClick = () => {
+        this.setState({
+            viewState: this.state.viewState === 'grid' ? 'speaker' : 'grid',
+        });
+    };
+
     public componentDidUpdate(prevProps: Props, prevState: State) {
         if (prevProps.theme.type !== this.props.theme.type) {
             this.style = this.genStyle();
@@ -591,7 +646,8 @@ export default class ExpandedView extends React.PureComponent<Props, State> {
             return;
         }
 
-        if (this.context?.conn?.readyState === WebSocket.OPEN) {
+        // TODO: remove this type casting once MM repo make conn property not private
+        if ((this.context as unknown as {conn?: WebSocket})?.conn?.readyState === WebSocket.OPEN) {
             this.requestCallState();
         } else {
             logDebug('ws not connected still, adding listener');
@@ -613,7 +669,6 @@ export default class ExpandedView extends React.PureComponent<Props, State> {
                 screenStream: stream,
             });
         });
-        callsClient.on('devicechange', this.setAudioDevices);
 
         callsClient.on('devicefallback', (device: MediaDeviceInfo) => {
             if (device.kind === 'audioinput') {
@@ -625,7 +680,7 @@ export default class ExpandedView extends React.PureComponent<Props, State> {
                             show: true,
                             args: {
                                 deviceLabel: device.label,
-                                i: (text: string) => <i>{text}</i>,
+                                i: (text: React.ReactNode) => <i>{text}</i>,
                             },
                         },
                     },
@@ -639,7 +694,7 @@ export default class ExpandedView extends React.PureComponent<Props, State> {
                             show: true,
                             args: {
                                 deviceLabel: device.label,
-                                i: (text: string) => <i>{text}</i>,
+                                i: (text: React.ReactNode) => <i>{text}</i>,
                             },
                         },
                     },
@@ -647,6 +702,20 @@ export default class ExpandedView extends React.PureComponent<Props, State> {
             }
         });
 
+        callsClient.on('localVideoStream', (stream: MediaStream) => {
+            this.setState({
+                selfVideoStream: stream,
+            });
+        });
+        callsClient.on('remoteVideoStream', (stream: MediaStream) => {
+            this.setState({
+                otherVideoStream: stream,
+            });
+        });
+        callsClient.on('devicechange', (audioDevices: MediaDevices, videoDevices: MediaDeviceInfo[]) => {
+            this.setAudioDevices(audioDevices);
+            this.setVideoDevices(videoDevices);
+        });
         callsClient.on('initaudio', () => {
             this.setState({
                 alerts: {
@@ -658,10 +727,24 @@ export default class ExpandedView extends React.PureComponent<Props, State> {
                 },
             });
         });
+        callsClient.on('initvideo', () => {
+            this.setState({
+                alerts: {
+                    ...this.state.alerts,
+                    missingVideoInputPermissions: {
+                        active: false,
+                        show: false,
+                    },
+                },
+            });
+        });
 
         this.setAudioDevices(callsClient.getAudioDevices());
+        this.setVideoDevices(callsClient.getVideoDevices());
 
         const screenStream = callsClient.getLocalScreenStream() || callsClient.getRemoteScreenStream();
+        const selfVideoStream = callsClient.localVideoStream;
+        const otherVideoStream = callsClient.getRemoteVideoStream();
 
         // eslint-disable-next-line react/no-did-mount-set-state
         this.setState({
@@ -672,8 +755,15 @@ export default class ExpandedView extends React.PureComponent<Props, State> {
                     active: !this.state.alerts.missingAudioInput.active && !callsClient.audioTrack,
                     show: !this.state.alerts.missingAudioInput.active && !callsClient.audioTrack,
                 },
+                missingVideoInputPermissions: {
+                    ...this.state.alerts.missingVideoInputPermissions,
+                    active: this.props.enableVideo && !this.state.alerts.missingVideoInput.active && !callsClient.localVideoStream,
+                    show: this.props.enableVideo && !this.state.alerts.missingVideoInput.active && !callsClient.localVideoStream,
+                },
             },
             screenStream,
+            selfVideoStream,
+            otherVideoStream,
         });
 
         if (window.opener) {
@@ -747,11 +837,13 @@ export default class ExpandedView extends React.PureComponent<Props, State> {
             return;
         }
 
+        const dismissedAt = serverDismissedAt(this.props.callRecording, this.props.callHostChangeAt);
+
         // Dismiss our prompt.
-        this.props.recordingPromptDismissedAt(this.props.channel.id, Date.now());
+        this.props.recordingPromptDismissedAt(this.props.channel.id, dismissedAt);
 
         // Dismiss the parent window's prompt.
-        window.opener?.callActions?.setRecordingPromptDismissedAt(this.props.channel.id, Date.now());
+        window.opener?.callActions?.setRecordingPromptDismissedAt(this.props.channel.id, dismissedAt);
     };
 
     onRemove = (sessionID: string, userID: string) => {
@@ -824,9 +916,172 @@ export default class ExpandedView extends React.PureComponent<Props, State> {
         return null;
     };
 
+    isRingingCallee = () => this.props.isDMCalling && Boolean(this.props.connectedDMUser);
+
+    renderTopVideoContainer = () => {
+        const {formatMessage} = this.props.intl;
+
+        // Here we are assuming this only renders in a DM which is the case
+        // right now.
+        const selfProfile = this.props.profiles[this.props.currentUserID];
+        const selfSession = this.props.currentSession;
+        const otherProfile = this.props.connectedDMUser;
+        const otherSession = this.props.otherSessions[0];
+
+        return (
+            <VideoProfilesTopContainer
+                className='calls-popout-top-video-container'
+            >
+                { selfProfile && selfSession &&
+                    <div style={{width: '156px', height: '88px'}}>
+                        <VideoProfile
+                            stream={this.state.selfVideoStream}
+                            profile={selfProfile}
+                            profileName={formatMessage({defaultMessage: '(you)'})}
+                            isMuted={!selfSession.unmuted}
+                            hasVideo={Boolean(selfSession.video)}
+                            isSpeaking={Boolean(selfSession.voice)}
+                            mirrorVideo={localStorage.getItem(STORAGE_CALLS_MIRROR_VIDEO_KEY) === 'true'}
+                            testID='calls-popout-video-profile-self'
+                        />
+                    </div>
+                }
+
+                {this.props.screenSharingSession && otherProfile && otherSession &&
+                    <div style={{width: '156px', height: '88px'}}>
+                        <VideoProfile
+                            stream={this.state.otherVideoStream}
+                            profile={otherProfile}
+                            profileName={getUserDisplayName(otherProfile)}
+                            isMuted={!otherSession.unmuted}
+                            hasVideo={Boolean(otherSession.video)}
+                            isSpeaking={Boolean(otherSession.voice)}
+                            mirrorVideo={false}
+                        />
+                    </div>
+                }
+            </VideoProfilesTopContainer>
+        );
+    };
+
+    renderVideoContainer = () => {
+        const {formatMessage} = this.props.intl;
+
+        // Here we are assuming this only renders in a DM which is the case
+        // right now.
+        const selfProfile = this.props.profiles[this.props.currentUserID];
+        const selfSession = this.props.currentSession;
+        const otherProfile = this.props.connectedDMUser;
+        const otherSession = this.props.otherSessions[0];
+
+        // If current user is the only one in the call, we show their video, otherwise we show the other user's video.
+        const session = this.props.otherSessions.length === 0 ? selfSession : otherSession;
+        const profile = this.props.otherSessions.length === 0 ? selfProfile : otherProfile;
+        const stream = this.props.otherSessions.length === 0 ? this.state.selfVideoStream : this.state.otherVideoStream;
+        const mirrorSelfVideo = localStorage.getItem(STORAGE_CALLS_MIRROR_VIDEO_KEY) === 'true';
+
+        const ringing = this.isRingingCallee();
+
+        const shouldRenderTopVideoContainer = this.state.viewState === 'speaker' && ((this.props.currentSession?.video && (this.props.otherSessions.length > 0 || ringing)) || this.props.otherSessions.some((s) => s.video));
+
+        const renderRingingProfile = (sizing: {width?: string, aspectRatio?: string}) => {
+            if (!otherProfile) {
+                return null;
+            }
+
+            return (
+                <VideoProfile
+                    stream={null}
+                    profile={otherProfile}
+                    profileName={getUserDisplayName(otherProfile)}
+                    isMuted={false}
+                    hasVideo={false}
+                    isSpeaking={false}
+                    mirrorVideo={false}
+                    width={sizing.width}
+                    aspectRatio={sizing.aspectRatio}
+                    ringing={true}
+                    testID='calls-popout-video-profile-ringing'
+                />
+            );
+        };
+
+        const renderSpeakerView = () => {
+            if (ringing) {
+                return renderRingingProfile({aspectRatio: '16/9'});
+            }
+
+            if (!profile || !session) {
+                return null;
+            }
+            return (
+                <VideoProfile
+                    stream={stream}
+                    profile={profile}
+                    profileName={session === selfSession ? `${getUserDisplayName(profile)} ${formatMessage({defaultMessage: '(you)'})}` : getUserDisplayName(profile)}
+                    isMuted={!session.unmuted}
+                    hasVideo={Boolean(session.video)}
+                    isSpeaking={Boolean(session.voice)}
+                    mirrorVideo={session === selfSession && mirrorSelfVideo}
+                    aspectRatio={session === otherSession && !session.video ? '16/9' : ''}
+                />
+            );
+        };
+
+        const renderGridView = () => {
+            return (
+                <>
+                    {ringing && renderRingingProfile({width: '100%'})}
+
+                    { !ringing && otherProfile && otherSession &&
+                    <VideoProfile
+                        stream={this.state.otherVideoStream}
+                        profile={otherProfile}
+                        profileName={getUserDisplayName(profile)}
+                        isMuted={!otherSession.unmuted}
+                        hasVideo={Boolean(otherSession.video)}
+                        isSpeaking={Boolean(otherSession.voice)}
+                        mirrorVideo={false}
+                        width={'100%'}
+                    />
+                    }
+
+                    { selfProfile && selfSession &&
+                    <VideoProfile
+                        stream={this.state.selfVideoStream}
+                        profile={selfProfile}
+                        profileName={`${getUserDisplayName(selfProfile)} ${formatMessage({defaultMessage: '(you)'})}`}
+                        isMuted={!selfSession.unmuted}
+                        hasVideo={Boolean(selfSession.video)}
+                        isSpeaking={Boolean(selfSession.voice)}
+                        mirrorVideo={mirrorSelfVideo}
+                        width={'100%'}
+                    />
+                    }
+                </>
+            );
+        };
+
+        return (
+            <VideoProfilesContainer
+                className='calls-popout-video-container'
+                $height={`calc(100vh - ${shouldRenderTopVideoContainer ? 220 : 124}px)`}
+            >
+                {this.state.viewState === 'speaker' && renderSpeakerView()}
+                {this.state.viewState === 'grid' && !this.props.screenSharingSession && renderGridView()}
+            </VideoProfilesContainer>
+        );
+    };
+
     renderScreenSharingPlayer = () => {
         const isSharing = this.props.screenSharingSession?.session_id === this.props.currentSession?.session_id;
         const {formatMessage} = this.props.intl;
+        const shouldRenderTopVideoContainer = (this.props.currentSession?.video && this.props.otherSessions.length > 0) || this.props.otherSessions.some((s) => s.video);
+
+        let heightAllowance = this.shouldRenderAlertBanner() ? 164 : 124;
+        if (shouldRenderTopVideoContainer) {
+            heightAllowance += 96;
+        }
 
         let profile;
         if (!isSharing) {
@@ -849,7 +1104,7 @@ export default class ExpandedView extends React.PureComponent<Props, State> {
                     ...this.style.screenContainer,
 
                     // Account for when we display an alert banner.
-                    maxHeight: `calc(100vh - ${this.shouldRenderAlertBanner() ? 164 : 124}px)`,
+                    maxHeight: `calc(100vh - ${heightAllowance}px)`,
                 }}
             >
                 <StyledMediaController
@@ -940,7 +1195,7 @@ export default class ExpandedView extends React.PureComponent<Props, State> {
             />
         );
 
-        if (hasRecStarted) {
+        if (hasRecStarted && isHost) {
             const {formatMessage} = this.props.intl;
             return (
                 <OverlayTrigger
@@ -984,6 +1239,21 @@ export default class ExpandedView extends React.PureComponent<Props, State> {
         const noScreenPermissions = this.state.alerts.missingScreenPermissions.active;
         const isMuted = this.isMuted();
         const MuteIcon = isMuted && !noInputDevices && !noAudioPermissions ? MutedIcon : UnmutedIcon;
+
+        const noVideoInputDevices = this.state.alerts.missingVideoInput.active;
+        const noVideoPermissions = this.state.alerts.missingVideoInputPermissions.active;
+        const isVideoOn = this.isVideoOn();
+        const VideoIcon = this.isVideoOn() || noVideoInputDevices || noVideoPermissions ? VideoOnIcon : VideoOffIcon;
+        let videoTooltipText = isVideoOn ? formatMessage({defaultMessage: 'Turn camera off'}) : formatMessage({defaultMessage: 'Turn camera on'});
+        let videoTooltipSubtext = '';
+        if (noVideoInputDevices) {
+            videoTooltipText = formatMessage(CallAlertConfigs.missingVideoInput.tooltipText!);
+            videoTooltipSubtext = formatMessage(CallAlertConfigs.missingVideoInput.tooltipSubtext!);
+        }
+        if (noVideoPermissions) {
+            videoTooltipText = formatMessage(CallAlertConfigs.missingVideoInputPermissions.tooltipText!);
+            videoTooltipSubtext = formatMessage(CallAlertConfigs.missingVideoInputPermissions.tooltipSubtext!);
+        }
 
         let muteTooltipText = isMuted ? formatMessage({defaultMessage: 'Unmute'}) : formatMessage({defaultMessage: 'Mute'});
         let muteTooltipSubtext = isMuted ? formatMessage({defaultMessage: 'Or hold space bar'}) : '';
@@ -1036,8 +1306,17 @@ export default class ExpandedView extends React.PureComponent<Props, State> {
         const RecordIcon = isRecording ? RecordSquareIcon : RecordCircleIcon;
         const ShareIcon = isSharing ? UnshareScreenIcon : ShareScreenIcon;
 
-        const leaveCallTooltipText = formatMessage({defaultMessage: 'Leave call'});
+        // A ringing DM call hasn't been answered yet, so hanging up cancels it rather than leaving it.
+        const leaveCallTooltipText = this.props.isDMCalling ? formatMessage({defaultMessage: 'Cancel call'}) : formatMessage({defaultMessage: 'Leave call'});
         const closeViewLabel = formatMessage({defaultMessage: 'Close window'});
+
+        const switchViewLabel = this.state.viewState === 'speaker' ? formatMessage({defaultMessage: 'Switch to grid view'}) : formatMessage({defaultMessage: 'Switch to speaker view'});
+        const SwitchViewIcon = this.state.viewState === 'speaker' ? SpeakerViewIcon : GridViewIcon;
+
+        const shouldRenderVideoContainer = this.props.currentSession?.video || this.props.otherSessions.some((s) => s.video);
+
+        const hasOtherParticipant = this.props.otherSessions.length > 0 || this.isRingingCallee();
+        const shouldRenderTopVideoContainer = (this.state.viewState === 'speaker' || this.props.screenSharingSession) && ((this.props.currentSession?.video && hasOtherParticipant) || this.props.otherSessions.some((s) => s.video));
 
         return (
             <div
@@ -1058,12 +1337,36 @@ export default class ExpandedView extends React.PureComponent<Props, State> {
                         style={this.style.topContainer}
                     >
                         {this.renderRecordingBadge()}
-                        <CallDuration
-                            startAt={this.props.callStartAt}
-                        />
+                        <CallStatusTimer clientConnecting={this.props.clientConnecting}/>
 
                         <div style={this.style.headerSpreader}/>
                         <ExpandedIncomingCallContainer/>
+
+                        { this.props.enableVideo && !this.props.screenSharingSession && shouldRenderVideoContainer && this.props.otherSessions.length > 0 &&
+                        <OverlayTrigger
+                            placement='bottom'
+                            key={'switch-view'}
+                            overlay={
+                                <Tooltip id='tooltip-switch-view'>
+                                    {switchViewLabel}
+                                </Tooltip>
+                            }
+                        >
+                            <SwitchViewButton
+                                className='style--none'
+                                onClick={this.onSwitchViewClick}
+                                aria-label={switchViewLabel}
+                            >
+                                <SwitchViewIcon
+                                    style={{
+                                        width: '20px',
+                                        height: '20px',
+                                    }}
+                                />
+                            </SwitchViewButton>
+                        </OverlayTrigger>
+                        }
+
                         <OverlayTrigger
                             placement='bottom'
                             key={'close-window'}
@@ -1088,17 +1391,22 @@ export default class ExpandedView extends React.PureComponent<Props, State> {
                         </OverlayTrigger>
                     </div>
 
-                    {!this.props.screenSharingSession && this.props.currentSession && this.props.channel &&
-                    <ParticipantsGrid
-                        callID={this.props.channel.id}
-                        callHostID={this.props.callHostID}
-                        currentSessionID={this.props.currentSession.session_id}
-                        currentUserID={this.props.currentUserID}
-                        profiles={this.props.profiles}
-                        sessions={this.props.sessions}
-                        onParticipantRemove={this.onRemove}
-                    />
+                    {shouldRenderTopVideoContainer && this.renderTopVideoContainer()}
+
+                    {!this.props.screenSharingSession && !shouldRenderVideoContainer && this.props.currentSession && this.props.channel &&
+                        <ParticipantsGrid
+                            callID={this.props.channel.id}
+                            callHostID={this.props.callHostID}
+                            currentSessionID={this.props.currentSession.session_id}
+                            currentUserID={this.props.currentUserID}
+                            profiles={this.props.profiles}
+                            sessions={this.props.sessions}
+                            onParticipantRemove={this.onRemove}
+                        />
                     }
+
+                    {!this.props.screenSharingSession && shouldRenderVideoContainer && this.renderVideoContainer()}
+
                     {this.props.screenSharingSession && this.renderScreenSharingPlayer()}
 
                     {this.state.showLiveCaptions &&
@@ -1111,28 +1419,30 @@ export default class ExpandedView extends React.PureComponent<Props, State> {
                         style={this.style.controls}
                     >
                         <div style={{flex: '1', display: 'flex', justifyContent: 'flex-start'}}>
-                            <ControlsButton
-                                id='calls-popout-participants-button'
-                                ariaLabel={participantsText}
-                                ariaControls='rhs-participant-list'
-                                ariaExpanded={this.state.showParticipantsList}
-                                onToggle={() => this.onParticipantsListToggle()}
-                                tooltipText={participantsText}
-                                shortcut={reverseKeyMappings.popout[PARTICIPANTS_LIST_TOGGLE][0]}
-                                bgColor={this.state.showParticipantsList ? 'white' : ''}
-                                bgColorHover={this.state.showParticipantsList ? 'rgba(255, 255, 255, 0.92)' : ''}
-                                iconFill={this.state.showParticipantsList ? 'rgba(var(--calls-bg-rgb), 0.80)' : ''}
-                                iconFillHover={this.state.showParticipantsList ? 'var(--calls-bg)' : ''}
-                                icon={
-                                    <ParticipantsIcon
-                                        style={{
-                                            width: '20px',
-                                            height: '20px',
-                                        }}
-                                    />
-                                }
-                                text={`${this.props.sessions.length}`}
-                            />
+                            {!isDMChannel(this.props.channel) && (
+                                <ControlsButton
+                                    id='calls-popout-participants-button'
+                                    ariaLabel={participantsText}
+                                    ariaControls='rhs-participant-list'
+                                    ariaExpanded={this.state.showParticipantsList}
+                                    onToggle={() => this.onParticipantsListToggle()}
+                                    tooltipText={participantsText}
+                                    shortcut={reverseKeyMappings.popout[PARTICIPANTS_LIST_TOGGLE][0]}
+                                    bgColor={this.state.showParticipantsList ? 'white' : ''}
+                                    bgColorHover={this.state.showParticipantsList ? 'rgba(255, 255, 255, 0.92)' : ''}
+                                    iconFill={this.state.showParticipantsList ? 'rgba(var(--calls-bg-rgb), 0.80)' : ''}
+                                    iconFillHover={this.state.showParticipantsList ? 'var(--calls-bg)' : ''}
+                                    icon={
+                                        <ParticipantsIcon
+                                            style={{
+                                                width: '20px',
+                                                height: '20px',
+                                            }}
+                                        />
+                                    }
+                                    text={`${this.props.sessions.length}`}
+                                />
+                            )}
                         </div>
 
                         <div style={this.style.centerControls}>
@@ -1160,6 +1470,33 @@ export default class ExpandedView extends React.PureComponent<Props, State> {
                                 }
                                 unavailable={noInputDevices || noAudioPermissions}
                             />
+
+                            {this.props.enableVideo &&
+                            <ControlsButton
+                                id='calls-popout-video-button'
+                                dataTestId={isVideoOn ? 'calls-popout-stop-video' : 'calls-popout-start-video'}
+                                ariaLabel={videoTooltipText}
+                                // eslint-disable-next-line no-undefined
+                                onToggle={noVideoInputDevices ? undefined : this.onVideoToggle}
+                                tooltipText={videoTooltipText}
+                                tooltipSubtext={videoTooltipSubtext}
+                                // eslint-disable-next-line no-undefined
+                                // shortcut={noVideoInputDevices || noVideoPermissions ? undefined : reverseKeyMappings.popout[MUTE_UNMUTE][0]}
+                                bgColor={isVideoOn ? 'rgba(61, 184, 135, 0.16)' : ''}
+                                bgColorHover={isVideoOn ? 'rgba(61, 184, 135, 0.20)' : ''}
+                                iconFill={isVideoOn ? 'rgba(61, 184, 135, 0.80)' : ''}
+                                iconFillHover={isVideoOn ? 'rgba(61, 184, 135, 0.80)' : ''}
+                                icon={
+                                    <VideoIcon
+                                        style={{
+                                            width: '20px',
+                                            height: '20px',
+                                        }}
+                                    />
+                                }
+                                unavailable={noVideoInputDevices || noVideoPermissions}
+                            />
+                            }
 
                             {this.props.allowScreenSharing &&
                                 <ControlsButton
@@ -1197,6 +1534,7 @@ export default class ExpandedView extends React.PureComponent<Props, State> {
                                     id='calls-popout-record-button'
                                     ariaLabel={recordTooltipText}
                                     onToggle={() => this.onRecordToggle()}
+                                    disabled={this.props.isDMCalling}
                                     tooltipText={recordTooltipText}
                                     // eslint-disable-next-line no-undefined
                                     shortcut={reverseKeyMappings.popout[RECORDING_TOGGLE][0]}
@@ -1239,24 +1577,41 @@ export default class ExpandedView extends React.PureComponent<Props, State> {
                             />
                         </div>
                         <div style={{flex: '1', display: 'flex', justifyContent: 'flex-end'}}>
-                            <DotMenu
-                                id='calls-popout-leave-button'
-                                ariaLabel={leaveCallTooltipText}
-                                icon={<LeaveCallIcon style={{fill: 'white', width: '20px', height: '20px'}}/>}
-                                dotMenuButton={LeaveCallButton}
-                                dropdownMenu={StyledDropdownMenu}
-                                placement={'top-end'}
-                                strategy={'fixed'}
-                                shortcut={reverseKeyMappings.widget[LEAVE_CALL][0]}
-                                tooltipText={leaveCallTooltipText}
-                            >
-                                <LeaveCallMenu
-                                    channelID={callsClient.channelID}
-                                    isHost={isHost}
-                                    numParticipants={this.props.sessions.length}
-                                    leaveCall={this.onDisconnectClick}
-                                />
-                            </DotMenu>
+                            {(isDMChannel(this.props.channel) || (!isHost && !this.props.isAdmin) || this.props.sessions.length <= 1) ? (
+                                <OverlayTrigger
+                                    placement='top'
+                                    overlay={<Tooltip id='calls-popout-leave-button-tooltip'>{leaveCallTooltipText}</Tooltip>}
+                                >
+                                    <LeaveCallButton
+                                        id='calls-popout-leave-button'
+                                        $isActive={false}
+                                        onClick={this.onDisconnectClick}
+                                        role='button'
+                                        aria-label={leaveCallTooltipText}
+                                    >
+                                        <LeaveCallIcon style={{fill: 'white', width: '20px', height: '20px'}}/>
+                                    </LeaveCallButton>
+                                </OverlayTrigger>
+                            ) : (
+                                <DotMenu
+                                    id='calls-popout-leave-button'
+                                    ariaLabel={leaveCallTooltipText}
+                                    icon={<LeaveCallIcon style={{fill: 'white', width: '20px', height: '20px'}}/>}
+                                    dotMenuButton={LeaveCallButton}
+                                    dropdownMenu={StyledDropdownMenu}
+                                    placement={'top-end'}
+                                    strategy={'fixed'}
+                                    shortcut={reverseKeyMappings.widget[LEAVE_CALL][0]}
+                                    tooltipText={leaveCallTooltipText}
+                                >
+                                    <LeaveCallMenu
+                                        channelID={callsClient.channelID}
+                                        isHost={isHost}
+                                        numParticipants={this.props.sessions.length}
+                                        leaveCall={this.onDisconnectClick}
+                                    />
+                                </DotMenu>
+                            )}
                         </div>
                     </div>
                 </div>
@@ -1480,6 +1835,35 @@ const CloseViewButton = styled.button`
     }
 `;
 
+const SwitchViewButton = styled.button`
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: none;
+    padding: 10px;
+    border-radius: 4px;
+
+    svg {
+        fill: rgba(255, 255, 255, 0.64);
+    }
+
+    &:hover {
+        background: rgba(255, 255, 255, 0.08);
+
+        svg {
+            fill: rgba(255, 255, 255, 0.72);
+        }
+    }
+
+    &:active {
+        background: rgba(255, 255, 255, 0.16);
+
+        svg {
+            fill: rgba(255, 255, 255, 0.80);
+        }
+    }
+`;
+
 const ReactionOverlay = styled.div`
     position: absolute;
     bottom: 96px;
@@ -1521,3 +1905,143 @@ const StyledDropdownMenu = styled(DropdownMenu)`
     margin-bottom: 2px;
     border-radius: 8px;
 `;
+
+const VideoProfilesTopContainer = styled.div`
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    padding: 0px 20px 8px 20px;
+`;
+
+const VideoProfilesContainer = styled.div<{$height: string}>`
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 12px;
+    flex: 1;
+    padding: 8px 20px;
+    max-width: 100vw;
+
+    ${({$height}) => $height && css`
+      height: ${$height};
+      max-height: ${$height};
+    `}
+`;
+
+const VideoProfileContainer = styled.div<{$width?: string, $aspectRatio?: string}>`
+  display: flex;
+  position: relative;
+  align-items: center;
+  justify-content: center;
+  background: black;
+  border-radius: 8px;
+  height: 100%;
+  max-height: 100%;
+  max-width: 100%;
+
+  ${({$aspectRatio}) => $aspectRatio && css`
+    aspect-ratio: ${$aspectRatio};
+  `}
+
+  ${({$width}) => $width && css`
+      width: ${$width};
+  `}
+`;
+
+const VideoProfilePlayer = styled.video<{$mirror: boolean}>`
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  border-radius: 8px;
+
+  ${({$mirror}) => $mirror && css`
+    transform: scaleX(-1);
+  `}
+`;
+
+const VideoProfileState = styled.div`
+  display: flex;
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  align-items: center;
+  justify-content: center;
+  border-radius: 0px 4px;
+  background: rgba(0, 0, 0, 0.80);
+  padding: 4px 6px;
+  gap: 2px;
+
+  font-size: 12px;
+  font-style: normal;
+  font-weight: 600;
+  line-height: 16px;
+`;
+
+type VideoProfileProps = {
+    stream: MediaStream | null;
+    profile: UserProfile;
+    profileName: string;
+    isMuted: boolean;
+    hasVideo: boolean;
+    isSpeaking: boolean;
+    mirrorVideo: boolean;
+    width?: string;
+    aspectRatio?: string;
+    ringing?: boolean;
+    testID?: string;
+};
+
+const VideoProfile = (props: VideoProfileProps) => {
+    const [videoEl, setVideoEl] = useState<HTMLVideoElement | null>(null);
+
+    const MuteIcon = props.isMuted ? MutedIcon : UnmutedIcon;
+
+    useEffect(() => {
+        if (videoEl && props.stream) {
+            videoEl.srcObject = props.stream;
+        }
+    }, [props.stream, videoEl]);
+
+    return (
+        <VideoProfileContainer
+            $width={props.width}
+            $aspectRatio={props.aspectRatio}
+            data-testid={props.testID}
+        >
+            {!props.hasVideo &&
+            <Avatar
+                size={80}
+                border={false}
+                url={Client4.getProfilePictureUrl(props.profile.id, props.profile.last_picture_update)}
+                borderGlowWidth={props.isSpeaking ? 3 : 0}
+                borderGlowColor='white'
+                className={props.ringing ? 'pulsingAnimation' : ''}
+            />
+            }
+
+            {props.hasVideo &&
+            <VideoProfilePlayer
+                ref={(el) => setVideoEl(el)}
+                autoPlay={true}
+                muted={true}
+                $mirror={props.mirrorVideo}
+            />
+            }
+
+            {props.isMuted &&
+            <VideoProfileState>
+                <MuteIcon
+                    fill={'#FF585B'}
+                    style={{
+                        width: '14px',
+                        height: '14px',
+                    }}
+                />
+                {props.profileName}
+            </VideoProfileState>
+            }
+        </VideoProfileContainer>
+    );
+};
+
